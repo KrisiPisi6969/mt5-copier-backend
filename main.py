@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timezone
@@ -7,9 +8,10 @@ import os
 import secrets
 
 
-app = FastAPI(title="MT5 Copier Test API with Licenses")
+app = FastAPI(title="MT5 Copier API + Admin Panel")
 
 DB_PATH = "licenses.db"
+ADMIN_TOKEN = "MY_SUPER_ADMIN_123"
 
 LATEST_SNAPSHOT = {
     "snapshot_id": "",
@@ -104,7 +106,6 @@ def get_license_by_key(license_key: str):
 def is_license_expired(expires_at: Optional[str]) -> bool:
     if not expires_at:
         return False
-
     try:
         exp = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
         now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -193,6 +194,11 @@ def validate_license_simple(license_key: str):
     return True, "License is valid", lic
 
 
+def require_admin_token(x_admin_token: Optional[str]):
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid admin token")
+
+
 # =============================
 # Models
 # =============================
@@ -256,14 +262,13 @@ def startup_event():
 
 
 # =============================
-# Routes
+# Public Routes
 # =============================
 @app.get("/")
 def root():
     return {
         "ok": True,
         "service": "mt5 copier api",
-        "db": os.path.abspath(DB_PATH),
         "time": datetime.now(timezone.utc).isoformat()
     }
 
@@ -340,8 +345,13 @@ def slave_pull(payload: SlavePullRequest):
     }
 
 
+# =============================
+# Protected Admin API
+# =============================
 @app.get("/admin/licenses")
-def admin_list_licenses():
+def admin_list_licenses(x_admin_token: Optional[str] = Header(None)):
+    require_admin_token(x_admin_token)
+
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -359,7 +369,9 @@ def admin_list_licenses():
 
 
 @app.post("/admin/create-license")
-def admin_create_license(payload: AdminCreateLicenseRequest):
+def admin_create_license(payload: AdminCreateLicenseRequest, x_admin_token: Optional[str] = Header(None)):
+    require_admin_token(x_admin_token)
+
     new_key = secrets.token_hex(8).upper()
 
     conn = get_conn()
@@ -388,7 +400,9 @@ def admin_create_license(payload: AdminCreateLicenseRequest):
 
 
 @app.post("/admin/license/{license_key}/update")
-def admin_update_license(license_key: str, payload: AdminUpdateLicenseRequest):
+def admin_update_license(license_key: str, payload: AdminUpdateLicenseRequest, x_admin_token: Optional[str] = Header(None)):
+    require_admin_token(x_admin_token)
+
     lic = get_license_by_key(license_key)
     if not lic:
         return {
@@ -423,7 +437,9 @@ def admin_update_license(license_key: str, payload: AdminUpdateLicenseRequest):
 
 
 @app.get("/admin/activations")
-def admin_list_activations():
+def admin_list_activations(x_admin_token: Optional[str] = Header(None)):
+    require_admin_token(x_admin_token)
+
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -446,3 +462,186 @@ def admin_list_activations():
         "ok": True,
         "activations": [dict(row) for row in rows]
     }
+
+
+# =============================
+# Admin Panel HTML
+# =============================
+@app.get("/admin-panel", response_class=HTMLResponse)
+def admin_panel():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>MT5 Copier Admin Panel</title>
+    <style>
+        body { font-family: Arial, sans-serif; background:#f5f7fb; margin:0; padding:24px; }
+        h1 { margin-top:0; }
+        .card { background:white; border-radius:12px; padding:16px; margin-bottom:16px; box-shadow:0 2px 10px rgba(0,0,0,0.08); }
+        input, button, textarea { padding:10px; margin:6px 0; font-size:14px; }
+        input { width:100%; box-sizing:border-box; }
+        button { cursor:pointer; border:none; border-radius:8px; background:#2563eb; color:white; padding:10px 14px; }
+        button.red { background:#dc2626; }
+        button.green { background:#16a34a; }
+        button.gray { background:#6b7280; }
+        table { width:100%; border-collapse:collapse; margin-top:10px; }
+        th, td { border-bottom:1px solid #ddd; padding:10px; text-align:left; vertical-align:top; }
+        .row { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; }
+        .small { color:#555; font-size:13px; }
+        pre { background:#111827; color:#e5e7eb; padding:12px; border-radius:8px; overflow:auto; }
+    </style>
+</head>
+<body>
+    <h1>MT5 Copier Admin Panel</h1>
+
+    <div class="card">
+        <h3>Admin Login</h3>
+        <input id="adminToken" type="password" placeholder="Enter admin token">
+        <button onclick="saveToken()">Save Token</button>
+        <div class="small">Current API: same server</div>
+    </div>
+
+    <div class="card">
+        <h3>Create License</h3>
+        <div class="row">
+            <div>
+                <label>Expires At</label>
+                <input id="expiresAt" value="2026-12-31 23:59:59">
+            </div>
+            <div>
+                <label>Max Accounts</label>
+                <input id="maxAccounts" value="1">
+            </div>
+            <div>
+                <label>Note</label>
+                <input id="note" value="Test client">
+            </div>
+        </div>
+        <button onclick="createLicense()">Create License</button>
+        <pre id="createResult"></pre>
+    </div>
+
+    <div class="card">
+        <h3>Licenses</h3>
+        <button onclick="loadLicenses()">Refresh Licenses</button>
+        <div id="licensesTable"></div>
+    </div>
+
+    <div class="card">
+        <h3>Activations</h3>
+        <button onclick="loadActivations()">Refresh Activations</button>
+        <div id="activationsTable"></div>
+    </div>
+
+<script>
+function getToken() {
+    return localStorage.getItem("admin_token") || "";
+}
+
+function saveToken() {
+    const token = document.getElementById("adminToken").value.trim();
+    localStorage.setItem("admin_token", token);
+    alert("Admin token saved.");
+}
+
+async function apiGet(url) {
+    const token = getToken();
+    const res = await fetch(url, {
+        headers: {
+            "x-admin-token": token
+        }
+    });
+    return await res.json();
+}
+
+async function apiPost(url, data) {
+    const token = getToken();
+    const res = await fetch(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "x-admin-token": token
+        },
+        body: JSON.stringify(data)
+    });
+    return await res.json();
+}
+
+async function createLicense() {
+    const expiresAt = document.getElementById("expiresAt").value.trim();
+    const maxAccounts = parseInt(document.getElementById("maxAccounts").value.trim() || "1");
+    const note = document.getElementById("note").value.trim();
+
+    const result = await apiPost("/admin/create-license", {
+        expires_at: expiresAt,
+        max_accounts: maxAccounts,
+        note: note
+    });
+
+    document.getElementById("createResult").textContent = JSON.stringify(result, null, 2);
+    loadLicenses();
+}
+
+async function loadLicenses() {
+    const result = await apiGet("/admin/licenses");
+
+    if (!result.ok) {
+        document.getElementById("licensesTable").innerHTML = "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
+        return;
+    }
+
+    let html = "<table><tr><th>Key</th><th>Status</th><th>Expires</th><th>Max</th><th>Note</th><th>Actions</th></tr>";
+    for (const lic of result.licenses) {
+        html += `
+        <tr>
+            <td>${lic.license_key}</td>
+            <td>${lic.status}</td>
+            <td>${lic.expires_at || ""}</td>
+            <td>${lic.max_accounts}</td>
+            <td>${lic.note || ""}</td>
+            <td>
+                <button class="green" onclick="setLicenseStatus('${lic.license_key}', 'active')">Activate</button>
+                <button class="red" onclick="setLicenseStatus('${lic.license_key}', 'inactive')">Deactivate</button>
+            </td>
+        </tr>`;
+    }
+    html += "</table>";
+    document.getElementById("licensesTable").innerHTML = html;
+}
+
+async function setLicenseStatus(licenseKey, status) {
+    const result = await apiPost(`/admin/license/${licenseKey}/update`, {
+        status: status
+    });
+    alert(JSON.stringify(result, null, 2));
+    loadLicenses();
+}
+
+async function loadActivations() {
+    const result = await apiGet("/admin/activations");
+
+    if (!result.ok) {
+        document.getElementById("activationsTable").innerHTML = "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
+        return;
+    }
+
+    let html = "<table><tr><th>License</th><th>Account</th><th>Broker</th><th>Machine</th><th>Created</th><th>Last Seen</th></tr>";
+    for (const row of result.activations) {
+        html += `
+        <tr>
+            <td>${row.license_key}</td>
+            <td>${row.account_login}</td>
+            <td>${row.broker_server}</td>
+            <td>${row.machine_id}</td>
+            <td>${row.created_at}</td>
+            <td>${row.last_seen_at}</td>
+        </tr>`;
+    }
+    html += "</table>";
+    document.getElementById("activationsTable").innerHTML = html;
+}
+</script>
+</body>
+</html>
+    """
