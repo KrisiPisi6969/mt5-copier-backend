@@ -8,7 +8,12 @@ import os
 import secrets
 
 
-app = FastAPI(title="MT5 Copier API + Admin Panel")
+app = FastAPI(
+    title="MT5 Copier API + Admin Panel",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
+)
 
 DB_PATH = "licenses.db"
 ADMIN_TOKEN = "MY_SUPER_ADMIN_123"
