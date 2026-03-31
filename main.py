@@ -18,7 +18,7 @@ app = FastAPI(
 DB_PATH = "licenses.db"
 
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "ChangeMe123!"
+ADMIN_PASSWORD = "rcx123"
 ADMIN_SESSIONS = {}
 
 LATEST_SNAPSHOT = {
@@ -539,11 +539,11 @@ def admin_panel():
     <div class="row">
         <div>
             <label>Username</label>
-            <input id="adminUsername" type="text" value="admin" placeholder="Username">
+           <input id="adminUsername" type="text" placeholder="Username">
         </div>
         <div>
             <label>Password</label>
-            <input id="adminPassword" type="password" value="ChangeMe123!" placeholder="Password">
+            <input id="adminPassword" type="password" placeholder="Password">
         </div>
         <div>
             <label>&nbsp;</label><br>
