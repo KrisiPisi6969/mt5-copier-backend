@@ -16,7 +16,10 @@ app = FastAPI(
 )
 
 DB_PATH = "licenses.db"
-ADMIN_TOKEN = "MY_SUPER_ADMIN_123"
+
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "ChangeMe123!"
+ADMIN_SESSIONS = {}
 
 LATEST_SNAPSHOT = {
     "snapshot_id": "",
@@ -199,14 +202,25 @@ def validate_license_simple(license_key: str):
     return True, "License is valid", lic
 
 
+def create_admin_session_token():
+    return secrets.token_hex(24)
+
+
 def require_admin_token(x_admin_token: Optional[str]):
-    if x_admin_token != ADMIN_TOKEN:
+    if not x_admin_token:
+        raise HTTPException(status_code=401, detail="Missing admin token")
+
+    if x_admin_token not in ADMIN_SESSIONS:
         raise HTTPException(status_code=401, detail="Invalid admin token")
 
 
 # =============================
 # Models
 # =============================
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+    
 class PositionItem(BaseModel):
     symbol: str
     type: str
@@ -353,6 +367,26 @@ def slave_pull(payload: SlavePullRequest):
 # =============================
 # Protected Admin API
 # =============================
+@app.post("/admin/login")
+def admin_login(payload: AdminLoginRequest):
+    if payload.username != ADMIN_USERNAME or payload.password != ADMIN_PASSWORD:
+        return {
+            "ok": False,
+            "message": "Invalid username or password"
+        }
+
+    token = create_admin_session_token()
+    ADMIN_SESSIONS[token] = {
+        "username": payload.username,
+        "created_at": utc_now_str()
+    }
+
+    return {
+        "ok": True,
+        "token": token,
+        "username": payload.username
+    }
+    
 @app.get("/admin/licenses")
 def admin_list_licenses(x_admin_token: Optional[str] = Header(None)):
     require_admin_token(x_admin_token)
@@ -500,12 +534,25 @@ def admin_panel():
 <body>
     <h1>MT5 Copier Admin Panel</h1>
 
-    <div class="card">
-        <h3>Admin Login</h3>
-        <input id="adminToken" type="password" placeholder="Enter admin token">
-        <button onclick="saveToken()">Save Token</button>
-        <div class="small">Current API: same server</div>
+<div class="card">
+    <h3>Admin Login</h3>
+    <div class="row">
+        <div>
+            <label>Username</label>
+            <input id="adminUsername" type="text" value="admin" placeholder="Username">
+        </div>
+        <div>
+            <label>Password</label>
+            <input id="adminPassword" type="password" value="ChangeMe123!" placeholder="Password">
+        </div>
+        <div>
+            <label>&nbsp;</label><br>
+            <button onclick="loginAdmin()">Login</button>
+        </div>
     </div>
+    <div class="small">Current API: same server</div>
+    <pre id="loginResult"></pre>
+</div>
 
     <div class="card">
         <h3>Create License</h3>
@@ -544,10 +591,30 @@ function getToken() {
     return localStorage.getItem("admin_token") || "";
 }
 
-function saveToken() {
-    const token = document.getElementById("adminToken").value.trim();
-    localStorage.setItem("admin_token", token);
-    alert("Admin token saved.");
+async function loginAdmin() {
+    const username = document.getElementById("adminUsername").value.trim();
+    const password = document.getElementById("adminPassword").value.trim();
+
+    const res = await fetch("/admin/login", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+            username: username,
+            password: password
+        })
+    });
+
+    const result = await res.json();
+    document.getElementById("loginResult").textContent = JSON.stringify(result, null, 2);
+
+    if (result.ok && result.token) {
+        localStorage.setItem("admin_token", result.token);
+        alert("Login successful.");
+    } else {
+        alert("Login failed.");
+    }
 }
 
 async function apiGet(url) {
