@@ -23,7 +23,7 @@ ADMIN_SESSIONS = {}
 
 LATEST_SNAPSHOT = {
     "snapshot_id": "",
-    "timestamp": "int(datetime.now(timezone.utc).timestamp())",
+    "timestamp": "",
     "positions": [],
     "pending_orders": []
 }
@@ -326,7 +326,7 @@ def master_publish(payload: MasterPublishRequest):
         }
 
     LATEST_SNAPSHOT["snapshot_id"] = payload.snapshot_id
-    LATEST_SNAPSHOT["timestamp"] = datetime.now(timezone.utc).isoformat()
+    LATEST_SNAPSHOT["timestamp"] = int(datetime.now(timezone.utc).timestamp())
     LATEST_SNAPSHOT["positions"] = [p.model_dump() for p in payload.positions]
     LATEST_SNAPSHOT["pending_orders"] = [o.model_dump() for o in payload.pending_orders]
 
