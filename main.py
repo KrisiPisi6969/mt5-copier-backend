@@ -23,7 +23,7 @@ ADMIN_SESSIONS = {}
 
 LATEST_SNAPSHOT = {
     "snapshot_id": "",
-    "timestamp": "",
+    "timestamp": "int(datetime.now(timezone.utc).timestamp())",
     "positions": [],
     "pending_orders": []
 }
