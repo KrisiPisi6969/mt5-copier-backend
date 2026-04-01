@@ -43,6 +43,19 @@ def get_conn():
 def utc_now_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+def refresh_last_seen_by_license(license_key: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE activations
+    SET last_seen_at = ?
+    WHERE license_id = (
+        SELECT id FROM licenses WHERE license_key = ?
+    )
+    """, (utc_now_str(), license_key))
+    conn.commit()
+    conn.close()
+
 
 def init_db():
     conn = get_conn()
@@ -376,12 +389,16 @@ def slave_pull(payload: SlavePullRequest):
             "message": message
         }
 
-    if payload.last_snapshot_id == LATEST_SNAPSHOT["snapshot_id"]:
-        return {
-            "ok": True,
-            "has_update": False,
-            "snapshot_id": payload.last_snapshot_id
-        }
+    # mark slave as live on every pull
+    refresh_last_seen_by_license(payload.license_key)
+
+if payload.last_snapshot_id == LATEST_SNAPSHOT["snapshot_id"]:
+    return {
+        "ok": True,
+        "has_update": False,
+        "snapshot_id": payload.last_snapshot_id,
+        "timestamp": LATEST_SNAPSHOT["timestamp"]
+    }
 
     return {
         "ok": True,
@@ -419,13 +436,33 @@ def admin_live_clients_text(x_admin_token: Optional[str] = Header(None)):
     conn.close()
 
     lines = []
+
     for row in rows:
-        lines.append(f'{row["license_key"]} | {row["account_login"]} | {row["broker_server"]} | {row["last_seen_at"]}')
+        age = seconds_ago_from_str(row["last_seen_at"])
+        if age >= 0:
+            lines.append(
+                f'{row["license_key"]} | {row["account_login"]} | {row["broker_server"]} | {age}s ago'
+            )
+        else:
+            lines.append(
+                f'{row["license_key"]} | {row["account_login"]} | {row["broker_server"]}'
+            )
+
+    while len(lines) < 5:
+        lines.append("-")
 
     return {
         "ok": True,
         "lines": lines
     }
+
+def seconds_ago_from_str(dt_str: str) -> int:
+    try:
+        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return max(0, int((now - dt).total_seconds()))
+    except Exception:
+        return -1
 
 @app.post("/admin/login")
 def admin_login(payload: AdminLoginRequest):
