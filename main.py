@@ -396,6 +396,37 @@ def slave_pull(payload: SlavePullRequest):
 # =============================
 # Protected Admin API
 # =============================
+@app.get("/admin/live-clients-text")
+def admin_live_clients_text(x_admin_token: Optional[str] = Header(None)):
+    require_admin_token(x_admin_token)
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    SELECT
+        l.license_key,
+        a.account_login,
+        a.broker_server,
+        a.last_seen_at
+    FROM activations a
+    JOIN licenses l ON l.id = a.license_id
+    WHERE a.last_seen_at >= datetime('now', '-2 minutes')
+    ORDER BY a.last_seen_at DESC
+    LIMIT 5
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    lines = []
+    for row in rows:
+        lines.append(f'{row["license_key"]} | {row["account_login"]} | {row["broker_server"]} | {row["last_seen_at"]}')
+
+    return {
+        "ok": True,
+        "lines": lines
+    }
+
 @app.post("/admin/login")
 def admin_login(payload: AdminLoginRequest):
     if payload.username != ADMIN_USERNAME or payload.password != ADMIN_PASSWORD:
