@@ -4,7 +4,6 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timezone
 import sqlite3
-import os
 import secrets
 
 
@@ -23,7 +22,7 @@ ADMIN_SESSIONS = {}
 
 LATEST_SNAPSHOT = {
     "snapshot_id": "",
-    "timestamp": "",
+    "timestamp": 0,
     "positions": [],
     "pending_orders": []
 }
@@ -40,21 +39,28 @@ def get_conn():
     return conn
 
 
-def utc_now_str():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+def utc_now():
+    return datetime.now(timezone.utc)
 
-def refresh_last_seen_by_license(license_key: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-    UPDATE activations
-    SET last_seen_at = ?
-    WHERE license_id = (
-        SELECT id FROM licenses WHERE license_key = ?
-    )
-    """, (utc_now_str(), license_key))
-    conn.commit()
-    conn.close()
+
+def utc_now_str():
+    return utc_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_utc_db_time(dt_str: Optional[str]) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    try:
+        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def seconds_ago_from_str(dt_str: Optional[str]) -> int:
+    dt = parse_utc_db_time(dt_str)
+    if dt is None:
+        return -1
+    return max(0, int((utc_now() - dt).total_seconds()))
 
 
 def init_db():
@@ -129,7 +135,7 @@ def is_license_expired(expires_at: Optional[str]) -> bool:
         return False
     try:
         exp = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        now = utc_now().replace(tzinfo=None)
         return exp < now
     except Exception:
         return True
@@ -177,6 +183,20 @@ def create_or_refresh_activation(license_id: int, account_login: str, broker_ser
     conn.close()
 
 
+def refresh_last_seen_by_license(license_key: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE activations
+    SET last_seen_at = ?
+    WHERE license_id = (
+        SELECT id FROM licenses WHERE license_key = ?
+    )
+    """, (utc_now_str(), license_key))
+    conn.commit()
+    conn.close()
+
+
 def validate_license_for_activation(license_key: str, account_login: str, broker_server: str, machine_id: str):
     lic = get_license_by_key(license_key)
     if not lic:
@@ -191,7 +211,6 @@ def validate_license_for_activation(license_key: str, account_login: str, broker
     conn = get_conn()
     cur = conn.cursor()
 
-    # already activated on same exact account_login
     cur.execute("""
     SELECT * FROM activations
     WHERE license_id = ? AND account_login = ?
@@ -208,7 +227,6 @@ def validate_license_for_activation(license_key: str, account_login: str, broker
         conn.close()
         return True, "License is valid", lic
 
-    # check if this license is already locked to another login
     cur.execute("""
     SELECT * FROM activations
     WHERE license_id = ?
@@ -219,7 +237,6 @@ def validate_license_for_activation(license_key: str, account_login: str, broker
         conn.close()
         return False, "License already used by another account login", None
 
-    # first activation
     cur.execute("""
     INSERT INTO activations (license_id, account_login, broker_server, machine_id, created_at, last_seen_at)
     VALUES (?, ?, ?, ?, ?, ?)
@@ -262,7 +279,8 @@ def require_admin_token(x_admin_token: Optional[str]):
 class AdminLoginRequest(BaseModel):
     username: str
     password: str
-    
+
+
 class PositionItem(BaseModel):
     symbol: str
     type: str
@@ -330,7 +348,7 @@ def root():
     return {
         "ok": True,
         "service": "mt5 copier api",
-        "time": datetime.now(timezone.utc).isoformat()
+        "time": utc_now().isoformat()
     }
 
 
@@ -368,7 +386,7 @@ def master_publish(payload: MasterPublishRequest):
         }
 
     LATEST_SNAPSHOT["snapshot_id"] = payload.snapshot_id
-    LATEST_SNAPSHOT["timestamp"] = int(datetime.now(timezone.utc).timestamp())
+    LATEST_SNAPSHOT["timestamp"] = int(utc_now().timestamp())
     LATEST_SNAPSHOT["positions"] = [p.model_dump() for p in payload.positions]
     LATEST_SNAPSHOT["pending_orders"] = [o.model_dump() for o in payload.pending_orders]
 
@@ -389,16 +407,15 @@ def slave_pull(payload: SlavePullRequest):
             "message": message
         }
 
-    # mark slave as live on every pull
     refresh_last_seen_by_license(payload.license_key)
 
-if payload.last_snapshot_id == LATEST_SNAPSHOT["snapshot_id"]:
-    return {
-        "ok": True,
-        "has_update": False,
-        "snapshot_id": payload.last_snapshot_id,
-        "timestamp": LATEST_SNAPSHOT["timestamp"]
-    }
+    if payload.last_snapshot_id == LATEST_SNAPSHOT["snapshot_id"]:
+        return {
+            "ok": True,
+            "has_update": False,
+            "snapshot_id": payload.last_snapshot_id,
+            "timestamp": LATEST_SNAPSHOT["timestamp"]
+        }
 
     return {
         "ok": True,
@@ -436,7 +453,6 @@ def admin_live_clients_text(x_admin_token: Optional[str] = Header(None)):
     conn.close()
 
     lines = []
-
     for row in rows:
         age = seconds_ago_from_str(row["last_seen_at"])
         if age >= 0:
@@ -456,13 +472,6 @@ def admin_live_clients_text(x_admin_token: Optional[str] = Header(None)):
         "lines": lines
     }
 
-def seconds_ago_from_str(dt_str: str) -> int:
-    try:
-        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        return max(0, int((now - dt).total_seconds()))
-    except Exception:
-        return -1
 
 @app.post("/admin/login")
 def admin_login(payload: AdminLoginRequest):
@@ -483,6 +492,7 @@ def admin_login(payload: AdminLoginRequest):
         "token": token,
         "username": payload.username
     }
+
 
 @app.get("/admin/dashboard")
 def admin_dashboard(x_admin_token: Optional[str] = Header(None)):
@@ -517,6 +527,7 @@ def admin_dashboard(x_admin_token: Optional[str] = Header(None)):
         "online_clients": online_clients,
         "server_time": utc_now_str()
     }
+
 
 @app.get("/admin/licenses")
 def admin_list_licenses(x_admin_token: Optional[str] = Header(None)):
