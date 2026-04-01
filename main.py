@@ -31,14 +31,8 @@ VALID_MASTER_TOKEN = "MASTER123"
 
 
 # =============================
-# Database helpers
+# Helpers
 # =============================
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def utc_now():
     return datetime.now(timezone.utc)
 
@@ -68,6 +62,59 @@ def add_days_to_dt_str(dt_str: Optional[str], days: int) -> str:
     if base is None:
         base = utc_now()
     return (base + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def time_left_seconds(expires_at: Optional[str]) -> Optional[int]:
+    dt = parse_utc_db_time(expires_at)
+    if dt is None:
+        return None
+    return int((dt - utc_now()).total_seconds())
+
+
+def format_time_left_human(expires_at: Optional[str]) -> str:
+    secs = time_left_seconds(expires_at)
+    if secs is None:
+        return "-"
+    if secs <= 0:
+        return "Expired"
+
+    days = secs // 86400
+    hours = (secs % 86400) // 3600
+    mins = (secs % 3600) // 60
+
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def online_status_from_last_seen(last_seen_at: Optional[str]) -> str:
+    age = seconds_ago_from_str(last_seen_at)
+    if age < 0:
+        return "offline"
+    if age <= 120:
+        return "online"
+    if age <= 600:
+        return "stale"
+    return "offline"
+
+
+def effective_license_status(db_status: str, expires_at: Optional[str]) -> str:
+    if db_status != "active":
+        return db_status
+    if expires_at and time_left_seconds(expires_at) is not None and time_left_seconds(expires_at) <= 0:
+        return "expired"
+    return "active"
+
+
+# =============================
+# Database helpers
+# =============================
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def has_column(conn, table_name: str, column_name: str) -> bool:
@@ -105,6 +152,7 @@ def init_db():
         broker_server TEXT NOT NULL,
         machine_id TEXT NOT NULL,
         balance REAL DEFAULT 0,
+        equity REAL DEFAULT 0,
         created_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
         UNIQUE(license_id, account_login, broker_server, machine_id),
@@ -112,12 +160,14 @@ def init_db():
     )
     """)
 
-    # migrations for older DBs
     if not has_column(conn, "licenses", "name"):
         cur.execute("ALTER TABLE licenses ADD COLUMN name TEXT DEFAULT ''")
 
     if not has_column(conn, "activations", "balance"):
         cur.execute("ALTER TABLE activations ADD COLUMN balance REAL DEFAULT 0")
+
+    if not has_column(conn, "activations", "equity"):
+        cur.execute("ALTER TABLE activations ADD COLUMN equity REAL DEFAULT 0")
 
     conn.commit()
     conn.close()
@@ -157,33 +207,9 @@ def get_license_by_key(license_key: str):
     return row
 
 
-def get_license_by_id(license_id: int):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM licenses WHERE id = ?", (license_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
 def is_license_expired(expires_at: Optional[str]) -> bool:
-    if not expires_at:
-        return False
-    try:
-        exp = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
-        now = utc_now().replace(tzinfo=None)
-        return exp < now
-    except Exception:
-        return True
-
-
-def count_activations(license_id: int) -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS cnt FROM activations WHERE license_id = ?", (license_id,))
-    row = cur.fetchone()
-    conn.close()
-    return int(row["cnt"])
+    secs = time_left_seconds(expires_at)
+    return secs is not None and secs <= 0
 
 
 def get_activation_by_login(license_id: int, account_login: str):
@@ -210,7 +236,8 @@ def get_activation_exact(license_id: int, account_login: str, broker_server: str
     return row
 
 
-def refresh_activation_seen(license_id: int, account_login: str, broker_server: str, machine_id: str, balance: float = 0.0):
+def refresh_activation_seen(license_id: int, account_login: str, broker_server: str, machine_id: str,
+                            balance: float = 0.0, equity: float = 0.0):
     conn = get_conn()
     cur = conn.cursor()
 
@@ -218,29 +245,33 @@ def refresh_activation_seen(license_id: int, account_login: str, broker_server: 
     if exact:
         cur.execute("""
         UPDATE activations
-        SET last_seen_at = ?, balance = ?
+        SET last_seen_at = ?, balance = ?, equity = ?
         WHERE id = ?
-        """, (utc_now_str(), balance, exact["id"]))
+        """, (utc_now_str(), balance, equity, exact["id"]))
     else:
         same_login = get_activation_by_login(license_id, account_login)
         if same_login:
             cur.execute("""
             UPDATE activations
-            SET broker_server = ?, machine_id = ?, last_seen_at = ?, balance = ?
+            SET broker_server = ?, machine_id = ?, last_seen_at = ?, balance = ?, equity = ?
             WHERE id = ?
-            """, (broker_server, machine_id, utc_now_str(), balance, same_login["id"]))
+            """, (broker_server, machine_id, utc_now_str(), balance, equity, same_login["id"]))
         else:
             cur.execute("""
-            INSERT INTO activations (license_id, account_login, broker_server, machine_id, balance, created_at, last_seen_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (license_id, account_login, broker_server, machine_id, balance, utc_now_str(), utc_now_str()))
+            INSERT INTO activations (license_id, account_login, broker_server, machine_id, balance, equity, created_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (license_id, account_login, broker_server, machine_id, balance, equity, utc_now_str(), utc_now_str()))
 
     conn.commit()
     conn.close()
 
 
-def refresh_last_seen_by_license(license_key: str, account_login: Optional[str] = None, broker_server: Optional[str] = None,
-                                 machine_id: Optional[str] = None, balance: Optional[float] = None):
+def refresh_last_seen_by_license(license_key: str,
+                                 account_login: Optional[str] = None,
+                                 broker_server: Optional[str] = None,
+                                 machine_id: Optional[str] = None,
+                                 balance: Optional[float] = None,
+                                 equity: Optional[float] = None):
     lic = get_license_by_key(license_key)
     if not lic:
         return
@@ -261,9 +292,10 @@ def refresh_last_seen_by_license(license_key: str, account_login: Optional[str] 
             SET last_seen_at = ?,
                 broker_server = COALESCE(?, broker_server),
                 machine_id = COALESCE(?, machine_id),
-                balance = COALESCE(?, balance)
+                balance = COALESCE(?, balance),
+                equity = COALESCE(?, equity)
             WHERE id = ?
-            """, (utc_now_str(), broker_server, machine_id, balance, row["id"]))
+            """, (utc_now_str(), broker_server, machine_id, balance, equity, row["id"]))
             conn.commit()
             conn.close()
             return
@@ -319,9 +351,9 @@ def validate_license_for_activation(license_key: str, account_login: str, broker
         return False, "Max accounts reached", None
 
     cur.execute("""
-    INSERT INTO activations (license_id, account_login, broker_server, machine_id, balance, created_at, last_seen_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (lic["id"], account_login, broker_server, machine_id, 0.0, utc_now_str(), utc_now_str()))
+    INSERT INTO activations (license_id, account_login, broker_server, machine_id, balance, equity, created_at, last_seen_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (lic["id"], account_login, broker_server, machine_id, 0.0, 0.0, utc_now_str(), utc_now_str()))
     conn.commit()
     conn.close()
 
@@ -349,7 +381,6 @@ def create_admin_session_token():
 def require_admin_token(x_admin_token: Optional[str]):
     if not x_admin_token:
         raise HTTPException(status_code=401, detail="Missing admin token")
-
     if x_admin_token not in ADMIN_SESSIONS:
         raise HTTPException(status_code=401, detail="Invalid admin token")
 
@@ -393,6 +424,7 @@ class SlaveActivateRequest(BaseModel):
     broker_server: str
     machine_id: str
     account_balance: Optional[float] = 0.0
+    account_equity: Optional[float] = 0.0
 
 
 class SlavePullRequest(BaseModel):
@@ -402,6 +434,7 @@ class SlavePullRequest(BaseModel):
     broker_server: Optional[str] = None
     machine_id: Optional[str] = None
     account_balance: Optional[float] = None
+    account_equity: Optional[float] = None
 
 
 class AdminCreateLicenseRequest(BaseModel):
@@ -466,7 +499,8 @@ def slave_activate(payload: SlaveActivateRequest):
         payload.account_login,
         payload.broker_server,
         payload.machine_id,
-        float(payload.account_balance or 0.0)
+        float(payload.account_balance or 0.0),
+        float(payload.account_equity or 0.0)
     )
 
     return {
@@ -514,7 +548,8 @@ def slave_pull(payload: SlavePullRequest):
         payload.account_login,
         payload.broker_server,
         payload.machine_id,
-        payload.account_balance
+        payload.account_balance,
+        payload.account_equity
     )
 
     if payload.last_snapshot_id == LATEST_SNAPSHOT["snapshot_id"]:
@@ -601,6 +636,12 @@ def admin_dashboard(x_admin_token: Optional[str] = Header(None)):
     """)
     online_clients = int(cur.fetchone()["cnt"])
 
+    cur.execute("SELECT COALESCE(SUM(balance),0) AS total_balance FROM activations")
+    total_balance = float(cur.fetchone()["total_balance"] or 0)
+
+    cur.execute("SELECT COALESCE(SUM(equity),0) AS total_equity FROM activations")
+    total_equity = float(cur.fetchone()["total_equity"] or 0)
+
     conn.close()
 
     return {
@@ -609,6 +650,8 @@ def admin_dashboard(x_admin_token: Optional[str] = Header(None)):
         "active_licenses": active_licenses,
         "total_activations": total_activations,
         "online_clients": online_clients,
+        "total_balance": total_balance,
+        "total_equity": total_equity,
         "server_time": utc_now_str()
     }
 
@@ -627,6 +670,7 @@ def admin_live_clients_text(x_admin_token: Optional[str] = Header(None)):
         a.account_login,
         a.broker_server,
         a.balance,
+        a.equity,
         a.last_seen_at
     FROM activations a
     JOIN licenses l ON l.id = a.license_id
@@ -641,15 +685,12 @@ def admin_live_clients_text(x_admin_token: Optional[str] = Header(None)):
     for row in rows:
         age = seconds_ago_from_str(row["last_seen_at"])
         label = row["name"] if (row["name"] or "").strip() else row["license_key"]
-        balance_text = f" | bal {float(row['balance'] or 0):.2f}" if row["balance"] is not None else ""
+        bal = float(row["balance"] or 0)
+        eq = float(row["equity"] or 0)
         if age >= 0:
-            lines.append(
-                f'{label} | {row["account_login"]} | {row["broker_server"]}{balance_text} | {age}s ago'
-            )
+            lines.append(f'{label} | {row["account_login"]} | bal {bal:.2f} | eq {eq:.2f} | {age}s ago')
         else:
-            lines.append(
-                f'{label} | {row["account_login"]} | {row["broker_server"]}{balance_text}'
-            )
+            lines.append(f'{label} | {row["account_login"]} | bal {bal:.2f} | eq {eq:.2f}')
 
     while len(lines) < 5:
         lines.append("-")
@@ -661,10 +702,7 @@ def admin_live_clients_text(x_admin_token: Optional[str] = Header(None)):
 
 
 @app.get("/admin/licenses")
-def admin_list_licenses(
-    q: str = "",
-    x_admin_token: Optional[str] = Header(None)
-):
+def admin_list_licenses(q: str = "", x_admin_token: Optional[str] = Header(None)):
     require_admin_token(x_admin_token)
 
     q = (q or "").strip()
@@ -673,42 +711,59 @@ def admin_list_licenses(
     conn = get_conn()
     cur = conn.cursor()
 
+    base_query = """
+    SELECT
+        l.id,
+        l.license_key,
+        l.name,
+        l.status,
+        l.expires_at,
+        l.max_accounts,
+        l.note,
+        l.created_at,
+        (
+            SELECT COUNT(*)
+            FROM activations a
+            WHERE a.license_id = l.id
+        ) AS activations_count,
+        (
+            SELECT MAX(a.last_seen_at)
+            FROM activations a
+            WHERE a.license_id = l.id
+        ) AS last_seen_at,
+        (
+            SELECT a.account_login
+            FROM activations a
+            WHERE a.license_id = l.id
+            ORDER BY a.last_seen_at DESC
+            LIMIT 1
+        ) AS latest_account_login,
+        (
+            SELECT a.broker_server
+            FROM activations a
+            WHERE a.license_id = l.id
+            ORDER BY a.last_seen_at DESC
+            LIMIT 1
+        ) AS latest_broker_server,
+        (
+            SELECT a.balance
+            FROM activations a
+            WHERE a.license_id = l.id
+            ORDER BY a.last_seen_at DESC
+            LIMIT 1
+        ) AS latest_balance,
+        (
+            SELECT a.equity
+            FROM activations a
+            WHERE a.license_id = l.id
+            ORDER BY a.last_seen_at DESC
+            LIMIT 1
+        ) AS latest_equity
+    FROM licenses l
+    """
+
     if q:
-        cur.execute("""
-        SELECT
-            l.id,
-            l.license_key,
-            l.name,
-            l.status,
-            l.expires_at,
-            l.max_accounts,
-            l.note,
-            l.created_at,
-            (
-                SELECT COUNT(*)
-                FROM activations a
-                WHERE a.license_id = l.id
-            ) AS activations_count,
-            (
-                SELECT MAX(a.last_seen_at)
-                FROM activations a
-                WHERE a.license_id = l.id
-            ) AS last_seen_at,
-            (
-                SELECT a.account_login
-                FROM activations a
-                WHERE a.license_id = l.id
-                ORDER BY a.last_seen_at DESC
-                LIMIT 1
-            ) AS latest_account_login,
-            (
-                SELECT a.balance
-                FROM activations a
-                WHERE a.license_id = l.id
-                ORDER BY a.last_seen_at DESC
-                LIMIT 1
-            ) AS latest_balance
-        FROM licenses l
+        cur.execute(base_query + """
         WHERE
             l.license_key LIKE ?
             OR l.name LIKE ?
@@ -722,50 +777,23 @@ def admin_list_licenses(
         ORDER BY l.id DESC
         """, (like_q, like_q, like_q, like_q))
     else:
-        cur.execute("""
-        SELECT
-            l.id,
-            l.license_key,
-            l.name,
-            l.status,
-            l.expires_at,
-            l.max_accounts,
-            l.note,
-            l.created_at,
-            (
-                SELECT COUNT(*)
-                FROM activations a
-                WHERE a.license_id = l.id
-            ) AS activations_count,
-            (
-                SELECT MAX(a.last_seen_at)
-                FROM activations a
-                WHERE a.license_id = l.id
-            ) AS last_seen_at,
-            (
-                SELECT a.account_login
-                FROM activations a
-                WHERE a.license_id = l.id
-                ORDER BY a.last_seen_at DESC
-                LIMIT 1
-            ) AS latest_account_login,
-            (
-                SELECT a.balance
-                FROM activations a
-                WHERE a.license_id = l.id
-                ORDER BY a.last_seen_at DESC
-                LIMIT 1
-            ) AS latest_balance
-        FROM licenses l
-        ORDER BY l.id DESC
-        """)
+        cur.execute(base_query + " ORDER BY l.id DESC")
 
     rows = cur.fetchall()
     conn.close()
 
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["effective_status"] = effective_license_status(item["status"], item["expires_at"])
+        item["client_status"] = online_status_from_last_seen(item["last_seen_at"])
+        item["time_left_text"] = format_time_left_human(item["expires_at"])
+        item["time_left_seconds"] = time_left_seconds(item["expires_at"])
+        items.append(item)
+
     return {
         "ok": True,
-        "licenses": [dict(row) for row in rows]
+        "licenses": items
     }
 
 
@@ -786,6 +814,7 @@ def admin_get_license(license_key: str, x_admin_token: Optional[str] = Header(No
         broker_server,
         machine_id,
         balance,
+        equity,
         created_at,
         last_seen_at
     FROM activations
@@ -797,7 +826,12 @@ def admin_get_license(license_key: str, x_admin_token: Optional[str] = Header(No
 
     return {
         "ok": True,
-        "license": dict(lic),
+        "license": {
+            **dict(lic),
+            "effective_status": effective_license_status(lic["status"], lic["expires_at"]),
+            "time_left_text": format_time_left_human(lic["expires_at"]),
+            "time_left_seconds": time_left_seconds(lic["expires_at"])
+        },
         "activations": activations
     }
 
@@ -812,10 +846,7 @@ def admin_create_license(payload: AdminCreateLicenseRequest, x_admin_token: Opti
 
     existing = get_license_by_key(license_key)
     if existing:
-        return {
-            "ok": False,
-            "message": "License key already exists"
-        }
+        return {"ok": False, "message": "License key already exists"}
 
     conn = get_conn()
     cur = conn.cursor()
@@ -851,10 +882,7 @@ def admin_update_license(license_key: str, payload: AdminUpdateLicenseRequest, x
 
     lic = get_license_by_key(license_key)
     if not lic:
-        return {
-            "ok": False,
-            "message": "License not found"
-        }
+        return {"ok": False, "message": "License not found"}
 
     new_license_key = (payload.new_license_key if payload.new_license_key is not None else lic["license_key"]).strip().upper()
     name = payload.name if payload.name is not None else lic["name"]
@@ -864,26 +892,17 @@ def admin_update_license(license_key: str, payload: AdminUpdateLicenseRequest, x
     note = payload.note if payload.note is not None else lic["note"]
 
     if not new_license_key:
-        return {
-            "ok": False,
-            "message": "License key cannot be empty"
-        }
+        return {"ok": False, "message": "License key cannot be empty"}
 
     if status not in ["active", "inactive"]:
-        return {
-            "ok": False,
-            "message": "Invalid status"
-        }
+        return {"ok": False, "message": "Invalid status"}
 
     max_accounts = max(1, int(max_accounts))
 
     if new_license_key != lic["license_key"]:
         existing = get_license_by_key(new_license_key)
         if existing:
-            return {
-                "ok": False,
-                "message": "New license key already exists"
-            }
+            return {"ok": False, "message": "New license key already exists"}
 
     conn = get_conn()
     cur = conn.cursor()
@@ -913,17 +932,11 @@ def admin_extend_license(license_key: str, payload: AdminExtendLicenseRequest, x
 
     lic = get_license_by_key(license_key)
     if not lic:
-        return {
-            "ok": False,
-            "message": "License not found"
-        }
+        return {"ok": False, "message": "License not found"}
 
     days = int(payload.days)
     if days <= 0:
-        return {
-            "ok": False,
-            "message": "Days must be positive"
-        }
+        return {"ok": False, "message": "Days must be positive"}
 
     new_expires_at = add_days_to_dt_str(lic["expires_at"], days)
 
@@ -951,10 +964,7 @@ def admin_reset_activations(license_key: str, x_admin_token: Optional[str] = Hea
 
     lic = get_license_by_key(license_key)
     if not lic:
-        return {
-            "ok": False,
-            "message": "License not found"
-        }
+        return {"ok": False, "message": "License not found"}
 
     conn = get_conn()
     cur = conn.cursor()
@@ -976,10 +986,7 @@ def admin_delete_license(license_key: str, x_admin_token: Optional[str] = Header
 
     lic = get_license_by_key(license_key)
     if not lic:
-        return {
-            "ok": False,
-            "message": "License not found"
-        }
+        return {"ok": False, "message": "License not found"}
 
     conn = get_conn()
     cur = conn.cursor()
@@ -1010,6 +1017,7 @@ def admin_list_activations(x_admin_token: Optional[str] = Header(None)):
         a.broker_server,
         a.machine_id,
         a.balance,
+        a.equity,
         a.created_at,
         a.last_seen_at
     FROM activations a
@@ -1019,9 +1027,15 @@ def admin_list_activations(x_admin_token: Optional[str] = Header(None)):
     rows = cur.fetchall()
     conn.close()
 
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["client_status"] = online_status_from_last_seen(item["last_seen_at"])
+        items.append(item)
+
     return {
         "ok": True,
-        "activations": [dict(row) for row in rows]
+        "activations": items
     }
 
 
@@ -1035,14 +1049,18 @@ def admin_online_clients(x_admin_token: Optional[str] = Header(None)):
     SELECT
         l.license_key,
         l.name,
+        l.note,
+        l.status,
+        l.expires_at,
         a.account_login,
         a.broker_server,
         a.machine_id,
         a.balance,
+        a.equity,
         a.last_seen_at
     FROM activations a
     JOIN licenses l ON l.id = a.license_id
-    WHERE a.last_seen_at >= datetime('now', '-2 minutes')
+    WHERE a.last_seen_at >= datetime('now', '-10 minutes')
     ORDER BY a.last_seen_at DESC
     """)
     rows = cur.fetchall()
@@ -1051,7 +1069,11 @@ def admin_online_clients(x_admin_token: Optional[str] = Header(None)):
     items = []
     for row in rows:
         item = dict(row)
-        item["age_sec"] = seconds_ago_from_str(row["last_seen_at"])
+        item["age_sec"] = seconds_ago_from_str(item["last_seen_at"])
+        item["effective_status"] = effective_license_status(item["status"], item["expires_at"])
+        item["client_status"] = online_status_from_last_seen(item["last_seen_at"])
+        item["time_left_text"] = format_time_left_human(item["expires_at"])
+        item["time_left_seconds"] = time_left_seconds(item["expires_at"])
         items.append(item)
 
     return {
@@ -1083,28 +1105,48 @@ def admin_panel():
         button.green { background:#16a34a; }
         button.gray { background:#6b7280; }
         button.orange { background:#ea580c; }
+        button.purple { background:#7c3aed; }
         table { width:100%; border-collapse:collapse; margin-top:10px; }
         th, td { border-bottom:1px solid #ddd; padding:10px; text-align:left; vertical-align:top; font-size:13px; }
+        th.sortable { cursor:pointer; user-select:none; white-space:nowrap; }
+        th.sortable:hover { background:#f3f4f6; }
         .row { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; }
         .row2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
         .small { color:#555; font-size:13px; }
         .muted { color:#666; }
         .hidden { display:none; }
         pre { background:#111827; color:#e5e7eb; padding:12px; border-radius:8px; overflow:auto; }
-        .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; }
+        .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; gap:12px; flex-wrap:wrap; }
         .badge { display:inline-block; padding:4px 8px; border-radius:999px; font-size:12px; color:white; }
-        .active { background:#16a34a; }
-        .inactive { background:#dc2626; }
+        .status-active { background:#16a34a; }
+        .status-inactive { background:#dc2626; }
+        .status-expired { background:#b91c1c; }
+        .client-online { background:#16a34a; }
+        .client-stale { background:#f59e0b; }
+        .client-offline { background:#6b7280; }
         .toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
         .actions button { margin-right:6px; margin-bottom:6px; }
+        .mono { font-family: Consolas, monospace; }
+        .nowrap { white-space:nowrap; }
         #editModalWrap {
             position:fixed; inset:0; background:rgba(0,0,0,0.45);
             display:none; align-items:center; justify-content:center; padding:20px; z-index:9999;
         }
         #editModal {
-            width:min(900px, 96vw); max-height:92vh; overflow:auto;
+            width:min(980px, 96vw); max-height:92vh; overflow:auto;
             background:white; border-radius:12px; padding:18px;
             box-shadow:0 10px 40px rgba(0,0,0,0.25);
+        }
+        .table-wrap { overflow:auto; }
+        .tiny { font-size:11px; color:#666; }
+        .metric-grid { display:grid; grid-template-columns:repeat(6,1fr); gap:12px; }
+        .metric { background:#f9fafb; border:1px solid #e5e7eb; border-radius:10px; padding:12px; }
+        .metric .label { font-size:12px; color:#666; }
+        .metric .value { font-size:18px; font-weight:bold; margin-top:4px; }
+        @media (max-width: 1100px) {
+            .metric-grid { grid-template-columns:repeat(2,1fr); }
+            .row { grid-template-columns:1fr; }
+            .row2 { grid-template-columns:1fr; }
         }
     </style>
 </head>
@@ -1128,16 +1170,17 @@ def admin_panel():
             <div>
                 <h1>MT5 Copier Admin Panel</h1>
                 <div class="small" id="welcomeBar"></div>
+                <div class="tiny">Auto refresh every 15 seconds</div>
             </div>
             <div class="toolbar">
-                <button class="gray" onclick="loadAll()">Refresh</button>
+                <button class="gray" onclick="loadAll()">Refresh now</button>
                 <button class="red" onclick="logoutAdmin()">Logout</button>
             </div>
         </div>
 
         <div class="card">
             <h3>Dashboard</h3>
-            <div id="dashboardStats" class="small">Loading...</div>
+            <div id="dashboardStats"></div>
         </div>
 
         <div class="card">
@@ -1177,24 +1220,50 @@ def admin_panel():
                     <label>Search by Name / License / Account Login</label>
                     <input id="searchInput" placeholder="e.g. Ivan, TEST-001, 123456" onkeydown="if(event.key==='Enter'){loadLicenses();}">
                 </div>
-                <div style="display:flex;align-items:end;">
-                    <button onclick="loadLicenses()">Search</button>
+                <div>
+                    <label>Sort By</label>
+                    <select id="sortField" onchange="loadLicenses()">
+                        <option value="name">Name</option>
+                        <option value="license_key">License Key</option>
+                        <option value="effective_status">License Status</option>
+                        <option value="client_status">Client Status</option>
+                        <option value="time_left_seconds">Time Left</option>
+                        <option value="expires_at">Expires At</option>
+                        <option value="latest_account_login">Account Login</option>
+                        <option value="latest_balance">Balance</option>
+                        <option value="latest_equity">Equity</option>
+                        <option value="last_seen_at">Last Seen</option>
+                    </select>
                 </div>
-                <div style="display:flex;align-items:end;">
-                    <button class="gray" onclick="clearSearch()">Clear</button>
+                <div>
+                    <label>Sort Direction</label>
+                    <select id="sortDir" onchange="loadLicenses()">
+                        <option value="asc">Ascending</option>
+                        <option value="desc" selected>Descending</option>
+                    </select>
                 </div>
             </div>
-            <div id="licensesTable"></div>
+            <div class="toolbar">
+                <button onclick="loadLicenses()">Search</button>
+                <button class="gray" onclick="clearSearch()">Clear</button>
+            </div>
+            <div class="table-wrap">
+                <div id="licensesTable"></div>
+            </div>
         </div>
 
         <div class="card">
-            <h3>Online Clients</h3>
-            <div id="onlineClientsTable"></div>
+            <h3>Online / Recent Clients</h3>
+            <div class="table-wrap">
+                <div id="onlineClientsTable"></div>
+            </div>
         </div>
 
         <div class="card">
             <h3>Activations</h3>
-            <div id="activationsTable"></div>
+            <div class="table-wrap">
+                <div id="activationsTable"></div>
+            </div>
         </div>
     </div>
 
@@ -1204,6 +1273,7 @@ def admin_panel():
                 <h3>Edit License</h3>
                 <button class="gray" onclick="closeEditModal()">Close</button>
             </div>
+
             <input type="hidden" id="editOriginalKey">
 
             <div class="row">
@@ -1234,12 +1304,8 @@ def admin_panel():
                     <input id="editMaxAccounts">
                 </div>
                 <div>
-                    <label>Quick Extend</label>
-                    <div class="toolbar">
-                        <button onclick="extendCurrentLicense(7)">+7 days</button>
-                        <button onclick="extendCurrentLicense(30)">+30 days</button>
-                        <button onclick="extendCurrentLicense(90)">+90 days</button>
-                    </div>
+                    <label>Time Left</label>
+                    <input id="editTimeLeft" disabled>
                 </div>
             </div>
 
@@ -1250,18 +1316,26 @@ def admin_panel():
 
             <div class="toolbar" style="margin-top:12px;">
                 <button class="green" onclick="saveLicenseEdit()">Save Changes</button>
+                <button class="purple" onclick="copyCurrentLicense()">Copy License</button>
+                <button onclick="extendCurrentLicense(7)">+7 days</button>
+                <button onclick="extendCurrentLicense(30)">+30 days</button>
+                <button onclick="extendCurrentLicense(90)">+90 days</button>
                 <button class="orange" onclick="resetActivationsCurrent()">Reset Activations</button>
                 <button class="red" onclick="deleteCurrentLicense()">Delete License</button>
             </div>
 
             <h3 style="margin-top:24px;">License Activations</h3>
-            <div id="editActivations"></div>
+            <div class="table-wrap">
+                <div id="editActivations"></div>
+            </div>
 
             <pre id="editResult"></pre>
         </div>
     </div>
 
 <script>
+let autoRefreshHandle = null;
+
 function getToken() {
     return localStorage.getItem("admin_token") || "";
 }
@@ -1299,9 +1373,7 @@ async function apiDelete(url) {
     const token = getToken();
     const res = await fetch(url, {
         method: "DELETE",
-        headers: {
-            "x-admin-token": token
-        }
+        headers: { "x-admin-token": token }
     });
     return await res.json();
 }
@@ -1309,11 +1381,29 @@ async function apiDelete(url) {
 function showLoginOnly() {
     document.getElementById("loginView").classList.remove("hidden");
     document.getElementById("appView").classList.add("hidden");
+    stopAutoRefresh();
 }
 
 function showAppOnly() {
     document.getElementById("loginView").classList.add("hidden");
     document.getElementById("appView").classList.remove("hidden");
+    startAutoRefresh();
+}
+
+function startAutoRefresh() {
+    stopAutoRefresh();
+    autoRefreshHandle = setInterval(() => {
+        if (!document.getElementById("appView").classList.contains("hidden")) {
+            loadAll();
+        }
+    }, 15000);
+}
+
+function stopAutoRefresh() {
+    if (autoRefreshHandle) {
+        clearInterval(autoRefreshHandle);
+        autoRefreshHandle = null;
+    }
 }
 
 async function verifySessionAndLoad() {
@@ -1367,6 +1457,59 @@ async function logoutAdmin() {
     showLoginOnly();
 }
 
+function licenseStatusBadge(status) {
+    let cls = "status-inactive";
+    if (status === "active") cls = "status-active";
+    else if (status === "expired") cls = "status-expired";
+    return `<span class="badge ${cls}">${escapeHtml(status)}</span>`;
+}
+
+function clientStatusBadge(status) {
+    let cls = "client-offline";
+    if (status === "online") cls = "client-online";
+    else if (status === "stale") cls = "client-stale";
+    return `<span class="badge ${cls}">${escapeHtml(status)}</span>`;
+}
+
+function safeNum(v, digits=2) {
+    if (v === null || v === undefined || v === "") return "";
+    const n = Number(v);
+    if (Number.isNaN(n)) return "";
+    return n.toFixed(digits);
+}
+
+function normalizeForSort(v) {
+    if (v === null || v === undefined) return null;
+    return v;
+}
+
+function sortItems(items, field, dir) {
+    const mul = dir === "asc" ? 1 : -1;
+    return [...items].sort((a, b) => {
+        let av = normalizeForSort(a[field]);
+        let bv = normalizeForSort(b[field]);
+
+        if (field === "expires_at" || field === "last_seen_at") {
+            av = av || "";
+            bv = bv || "";
+        }
+
+        if (field === "latest_balance" || field === "latest_equity" || field === "time_left_seconds") {
+            av = (av === null || av === undefined) ? -999999999 : Number(av);
+            bv = (bv === null || bv === undefined) ? -999999999 : Number(bv);
+        }
+
+        if (field === "effective_status" || field === "client_status" || field === "name" || field === "license_key" || field === "latest_account_login") {
+            av = String(av || "").toLowerCase();
+            bv = String(bv || "").toLowerCase();
+        }
+
+        if (av < bv) return -1 * mul;
+        if (av > bv) return 1 * mul;
+        return 0;
+    });
+}
+
 async function loadDashboard() {
     const result = await apiGet("/admin/dashboard");
     if (!result.ok) {
@@ -1375,11 +1518,15 @@ async function loadDashboard() {
     }
 
     document.getElementById("dashboardStats").innerHTML = `
-        Total licenses: <b>${result.total_licenses}</b> |
-        Active licenses: <b>${result.active_licenses}</b> |
-        Total activations: <b>${result.total_activations}</b> |
-        Online clients: <b>${result.online_clients}</b> |
-        Server time: <b>${result.server_time}</b>
+        <div class="metric-grid">
+            <div class="metric"><div class="label">Total Licenses</div><div class="value">${result.total_licenses}</div></div>
+            <div class="metric"><div class="label">Active Licenses</div><div class="value">${result.active_licenses}</div></div>
+            <div class="metric"><div class="label">Total Activations</div><div class="value">${result.total_activations}</div></div>
+            <div class="metric"><div class="label">Online Clients</div><div class="value">${result.online_clients}</div></div>
+            <div class="metric"><div class="label">Total Balance</div><div class="value">${safeNum(result.total_balance)}</div></div>
+            <div class="metric"><div class="label">Total Equity</div><div class="value">${safeNum(result.total_equity)}</div></div>
+        </div>
+        <div class="small" style="margin-top:10px;">Server time: <b>${escapeHtml(result.server_time)}</b></div>
     `;
 }
 
@@ -1414,13 +1561,11 @@ function clearSearch() {
     loadLicenses();
 }
 
-function statusBadge(status) {
-    const cls = status === "active" ? "active" : "inactive";
-    return `<span class="badge ${cls}">${status}</span>`;
-}
-
 async function loadLicenses() {
     const q = document.getElementById("searchInput").value.trim();
+    const sortField = document.getElementById("sortField").value;
+    const sortDir = document.getElementById("sortDir").value;
+
     const result = await apiGet("/admin/licenses?q=" + encodeURIComponent(q));
 
     if (!result.ok) {
@@ -1428,38 +1573,50 @@ async function loadLicenses() {
         return;
     }
 
+    const items = sortItems(result.licenses, sortField, sortDir);
+
     let html = `
     <table>
       <tr>
-        <th>Name</th>
-        <th>License Key</th>
-        <th>Status</th>
-        <th>Expires</th>
-        <th>Max Acc</th>
-        <th>Latest Login</th>
-        <th>Balance</th>
-        <th>Last Seen</th>
-        <th>Note</th>
+        <th class="sortable" onclick="setSort('name')">Name</th>
+        <th class="sortable" onclick="setSort('license_key')">License Key</th>
+        <th class="sortable" onclick="setSort('effective_status')">License Status</th>
+        <th class="sortable" onclick="setSort('client_status')">Client Status</th>
+        <th class="sortable" onclick="setSort('expires_at')">Expires At</th>
+        <th class="sortable" onclick="setSort('time_left_seconds')">Time Left</th>
+        <th>Max</th>
+        <th class="sortable" onclick="setSort('latest_account_login')">Account Login</th>
+        <th>Broker</th>
+        <th class="sortable" onclick="setSort('latest_balance')">Balance</th>
+        <th class="sortable" onclick="setSort('latest_equity')">Equity</th>
+        <th class="sortable" onclick="setSort('last_seen_at')">Last Seen</th>
+        <th>Notes</th>
         <th>Actions</th>
       </tr>
     `;
 
-    for (const lic of result.licenses) {
+    for (const lic of items) {
         html += `
         <tr>
             <td>${escapeHtml(lic.name || "")}</td>
-            <td>${escapeHtml(lic.license_key)}</td>
-            <td>${statusBadge(lic.status)}</td>
-            <td>${escapeHtml(lic.expires_at || "")}</td>
+            <td class="mono">${escapeHtml(lic.license_key)}</td>
+            <td>${licenseStatusBadge(lic.effective_status)}</td>
+            <td>${clientStatusBadge(lic.client_status)}</td>
+            <td class="nowrap">${escapeHtml(lic.expires_at || "")}</td>
+            <td class="nowrap">${escapeHtml(lic.time_left_text || "-")}</td>
             <td>${lic.max_accounts}</td>
             <td>${escapeHtml(lic.latest_account_login || "")}</td>
-            <td>${lic.latest_balance != null ? Number(lic.latest_balance).toFixed(2) : ""}</td>
-            <td>${escapeHtml(lic.last_seen_at || "")}</td>
+            <td>${escapeHtml(lic.latest_broker_server || "")}</td>
+            <td>${safeNum(lic.latest_balance)}</td>
+            <td>${safeNum(lic.latest_equity)}</td>
+            <td class="nowrap">${escapeHtml(lic.last_seen_at || "")}</td>
             <td>${escapeHtml(lic.note || "")}</td>
             <td class="actions">
                 <button onclick="openEditModal('${jsq(lic.license_key)}')">Edit</button>
+                <button class="purple" onclick="copyLicense('${jsq(lic.license_key)}')">Copy</button>
                 <button class="green" onclick="quickStatus('${jsq(lic.license_key)}','active')">Activate</button>
                 <button class="red" onclick="quickStatus('${jsq(lic.license_key)}','inactive')">Deactivate</button>
+                <button onclick="quickExtend('${jsq(lic.license_key)}',7)">+7d</button>
                 <button class="orange" onclick="quickExtend('${jsq(lic.license_key)}',30)">+30d</button>
             </td>
         </tr>
@@ -1468,6 +1625,19 @@ async function loadLicenses() {
 
     html += "</table>";
     document.getElementById("licensesTable").innerHTML = html;
+}
+
+function setSort(field) {
+    const sortField = document.getElementById("sortField");
+    const sortDir = document.getElementById("sortDir");
+
+    if (sortField.value === field) {
+        sortDir.value = sortDir.value === "asc" ? "desc" : "asc";
+    } else {
+        sortField.value = field;
+        sortDir.value = "desc";
+    }
+    loadLicenses();
 }
 
 async function quickStatus(licenseKey, status) {
@@ -1499,23 +1669,33 @@ async function loadOnlineClients() {
       <tr>
         <th>Name</th>
         <th>License</th>
+        <th>License Status</th>
+        <th>Client Status</th>
         <th>Account Login</th>
         <th>Broker</th>
         <th>Balance</th>
+        <th>Equity</th>
+        <th>Expires</th>
+        <th>Time Left</th>
         <th>Last Seen</th>
-        <th>Age</th>
+        <th>Notes</th>
       </tr>
     `;
     for (const row of result.clients) {
         html += `
         <tr>
           <td>${escapeHtml(row.name || "")}</td>
-          <td>${escapeHtml(row.license_key)}</td>
+          <td class="mono">${escapeHtml(row.license_key)}</td>
+          <td>${licenseStatusBadge(row.effective_status)}</td>
+          <td>${clientStatusBadge(row.client_status)}</td>
           <td>${escapeHtml(row.account_login || "")}</td>
           <td>${escapeHtml(row.broker_server || "")}</td>
-          <td>${row.balance != null ? Number(row.balance).toFixed(2) : ""}</td>
-          <td>${escapeHtml(row.last_seen_at || "")}</td>
-          <td>${row.age_sec >= 0 ? row.age_sec + "s" : ""}</td>
+          <td>${safeNum(row.balance)}</td>
+          <td>${safeNum(row.equity)}</td>
+          <td class="nowrap">${escapeHtml(row.expires_at || "")}</td>
+          <td class="nowrap">${escapeHtml(row.time_left_text || "-")}</td>
+          <td class="nowrap">${escapeHtml(row.last_seen_at || "")}</td>
+          <td>${escapeHtml(row.note || "")}</td>
         </tr>
         `;
     }
@@ -1536,10 +1716,12 @@ async function loadActivations() {
       <tr>
         <th>Name</th>
         <th>License</th>
+        <th>Status</th>
         <th>Account</th>
         <th>Broker</th>
         <th>Machine</th>
         <th>Balance</th>
+        <th>Equity</th>
         <th>Created</th>
         <th>Last Seen</th>
       </tr>
@@ -1548,13 +1730,15 @@ async function loadActivations() {
         html += `
         <tr>
             <td>${escapeHtml(row.name || "")}</td>
-            <td>${escapeHtml(row.license_key)}</td>
+            <td class="mono">${escapeHtml(row.license_key)}</td>
+            <td>${clientStatusBadge(row.client_status)}</td>
             <td>${escapeHtml(row.account_login)}</td>
             <td>${escapeHtml(row.broker_server)}</td>
             <td>${escapeHtml(row.machine_id)}</td>
-            <td>${row.balance != null ? Number(row.balance).toFixed(2) : ""}</td>
-            <td>${escapeHtml(row.created_at)}</td>
-            <td>${escapeHtml(row.last_seen_at)}</td>
+            <td>${safeNum(row.balance)}</td>
+            <td>${safeNum(row.equity)}</td>
+            <td class="nowrap">${escapeHtml(row.created_at)}</td>
+            <td class="nowrap">${escapeHtml(row.last_seen_at)}</td>
         </tr>
         `;
     }
@@ -1584,16 +1768,18 @@ async function openEditModal(licenseKey) {
     document.getElementById("editExpiresAt").value = lic.expires_at || "";
     document.getElementById("editMaxAccounts").value = lic.max_accounts || 1;
     document.getElementById("editNote").value = lic.note || "";
+    document.getElementById("editTimeLeft").value = lic.time_left_text || "-";
     document.getElementById("editResult").textContent = "";
 
-    let html = "<table><tr><th>Account</th><th>Broker</th><th>Machine</th><th>Balance</th><th>Created</th><th>Last Seen</th></tr>";
+    let html = "<table><tr><th>Account</th><th>Broker</th><th>Machine</th><th>Balance</th><th>Equity</th><th>Created</th><th>Last Seen</th></tr>";
     for (const a of result.activations) {
         html += `
         <tr>
           <td>${escapeHtml(a.account_login || "")}</td>
           <td>${escapeHtml(a.broker_server || "")}</td>
           <td>${escapeHtml(a.machine_id || "")}</td>
-          <td>${a.balance != null ? Number(a.balance).toFixed(2) : ""}</td>
+          <td>${safeNum(a.balance)}</td>
+          <td>${safeNum(a.equity)}</td>
           <td>${escapeHtml(a.created_at || "")}</td>
           <td>${escapeHtml(a.last_seen_at || "")}</td>
         </tr>`;
@@ -1641,6 +1827,7 @@ async function extendCurrentLicense(days) {
     if (result.ok) {
         document.getElementById("editExpiresAt").value = result.expires_at;
         await loadAll();
+        await openEditModal(key);
     }
 }
 
@@ -1667,6 +1854,20 @@ async function deleteCurrentLicense() {
         closeEditModal();
         await loadAll();
     }
+}
+
+async function copyLicense(licenseKey) {
+    try {
+        await navigator.clipboard.writeText(licenseKey);
+        alert("License copied: " + licenseKey);
+    } catch (e) {
+        alert("Could not copy license.");
+    }
+}
+
+async function copyCurrentLicense() {
+    const key = document.getElementById("editLicenseKey").value.trim();
+    if (key) await copyLicense(key);
 }
 
 function escapeHtml(str) {
