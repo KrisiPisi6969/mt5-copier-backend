@@ -175,16 +175,45 @@ def validate_license_for_activation(license_key: str, account_login: str, broker
     if is_license_expired(lic["expires_at"]):
         return False, "License expired", None
 
-    existing = get_activation(lic["id"], account_login, broker_server, machine_id)
-    if existing:
-        create_or_refresh_activation(lic["id"], account_login, broker_server, machine_id)
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # already activated on same exact account_login
+    cur.execute("""
+    SELECT * FROM activations
+    WHERE license_id = ? AND account_login = ?
+    """, (lic["id"], account_login))
+    same_login = cur.fetchone()
+
+    if same_login:
+        cur.execute("""
+        UPDATE activations
+        SET last_seen_at = ?, broker_server = ?, machine_id = ?
+        WHERE id = ?
+        """, (utc_now_str(), broker_server, machine_id, same_login["id"]))
+        conn.commit()
+        conn.close()
         return True, "License is valid", lic
 
-    activation_count = count_activations(lic["id"])
-    if activation_count >= int(lic["max_accounts"]):
-        return False, "Activation limit reached", None
+    # check if this license is already locked to another login
+    cur.execute("""
+    SELECT * FROM activations
+    WHERE license_id = ?
+    """, (lic["id"],))
+    any_activation = cur.fetchone()
 
-    create_or_refresh_activation(lic["id"], account_login, broker_server, machine_id)
+    if any_activation:
+        conn.close()
+        return False, "License already used by another account login", None
+
+    # first activation
+    cur.execute("""
+    INSERT INTO activations (license_id, account_login, broker_server, machine_id, created_at, last_seen_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """, (lic["id"], account_login, broker_server, machine_id, utc_now_str(), utc_now_str()))
+    conn.commit()
+    conn.close()
+
     return True, "License is valid", lic
 
 
