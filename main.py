@@ -19,24 +19,6 @@ app = FastAPI(
 
 DB_PATH = "licenses.db"
 
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "rcx123")
-ADMIN_OTP_EMAIL = os.getenv("ADMIN_OTP_EMAIL", "")
-
-SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-SMTP_FROM = os.getenv("SMTP_FROM")
-SMTP_USE_TLS = os.getenv("SMTP_USE_TLS") == "true"
-
-ADMIN_SESSIONS = {}
-ADMIN_LOGIN_CHALLENGES = {}
-
-ADMIN_SESSION_TTL_MINUTES = 30
-ADMIN_OTP_TTL_MINUTES = 5
-ADMIN_OTP_MAX_ATTEMPTS = 3
-
 LATEST_SNAPSHOT = {
     "snapshot_id": "",
     "timestamp": 0,
@@ -45,6 +27,79 @@ LATEST_SNAPSHOT = {
 }
 
 VALID_MASTER_TOKEN = "MASTER123"
+
+ADMIN_SESSIONS = {}
+ADMIN_LOGIN_CHALLENGES = {}
+
+ADMIN_SESSION_TTL_MINUTES = 30
+ADMIN_OTP_TTL_MINUTES = 5
+ADMIN_OTP_MAX_ATTEMPTS = 3
+
+
+# =============================
+# ENV helpers
+# =============================
+def env_str(name: str, default: str = "") -> str:
+    value = os.getenv(name, default)
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = env_str(name, "")
+    if value == "":
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def env_int(name: str, default: int) -> int:
+    value = env_str(name, "")
+    if value == "":
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def get_admin_username() -> str:
+    return env_str("ADMIN_USERNAME", "admin")
+
+
+def get_admin_password() -> str:
+    return env_str("ADMIN_PASSWORD", "rcx123")
+
+
+def get_admin_otp_email() -> str:
+    return env_str("ADMIN_OTP_EMAIL", "")
+
+
+def get_smtp_host() -> str:
+    return env_str("SMTP_HOST", "")
+
+
+def get_smtp_port() -> int:
+    return env_int("SMTP_PORT", 587)
+
+
+def get_smtp_username() -> str:
+    return env_str("SMTP_USERNAME", "")
+
+
+def get_smtp_password() -> str:
+    return env_str("SMTP_PASSWORD", "")
+
+
+def get_smtp_from() -> str:
+    smtp_from = env_str("SMTP_FROM", "")
+    if smtp_from != "":
+        return smtp_from
+    return get_smtp_username()
+
+
+def get_smtp_use_tls() -> bool:
+    return env_bool("SMTP_USE_TLS", True)
 
 
 # =============================
@@ -120,32 +175,61 @@ def online_status_from_last_seen(last_seen_at: Optional[str]) -> str:
 def effective_license_status(db_status: str, expires_at: Optional[str]) -> str:
     if db_status != "active":
         return db_status
-    if expires_at and time_left_seconds(expires_at) is not None and time_left_seconds(expires_at) <= 0:
+    secs = time_left_seconds(expires_at)
+    if secs is not None and secs <= 0:
         return "expired"
     return "active"
 
 
+def smtp_config_debug() -> dict:
+    return {
+        "ADMIN_OTP_EMAIL": get_admin_otp_email(),
+        "SMTP_HOST": get_smtp_host(),
+        "SMTP_PORT": get_smtp_port(),
+        "SMTP_USERNAME": get_smtp_username(),
+        "SMTP_FROM": get_smtp_from(),
+        "SMTP_USE_TLS": get_smtp_use_tls(),
+        "HAS_SMTP_PASSWORD": get_smtp_password() != "",
+    }
+
+
 def send_email_code(to_email: str, code: str) -> tuple[bool, str]:
+    smtp_host = get_smtp_host()
+    smtp_port = get_smtp_port()
+    smtp_username = get_smtp_username()
+    smtp_password = get_smtp_password()
+    smtp_from = get_smtp_from()
+    smtp_use_tls = get_smtp_use_tls()
+
     if not to_email:
         return False, "Missing ADMIN_OTP_EMAIL"
-    if not SMTP_HOST or not SMTP_FROM:
-        return False, "SMTP is not configured"
+
+    if not smtp_host:
+        return False, "SMTP is not configured: missing SMTP_HOST"
+
+    if not smtp_from:
+        return False, "SMTP is not configured: missing SMTP_FROM or SMTP_USERNAME"
 
     subject = "Your admin verification code"
     body = f"Your verification code is: {code}\n\nThis code expires in {ADMIN_OTP_TTL_MINUTES} minutes."
 
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
-    msg["From"] = SMTP_FROM
+    msg["From"] = smtp_from
     msg["To"] = to_email
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-            if SMTP_USE_TLS:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+            server.ehlo()
+            if smtp_use_tls:
                 server.starttls()
-            if SMTP_USERNAME:
-                server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.sendmail(SMTP_FROM, [to_email], msg.as_string())
+                server.ehlo()
+
+            if smtp_username:
+                server.login(smtp_username, smtp_password)
+
+            server.sendmail(smtp_from, [to_email], msg.as_string())
+
         return True, "Verification code sent"
     except Exception as e:
         return False, f"Failed to send verification email: {str(e)}"
@@ -549,6 +633,7 @@ class AdminExtendLicenseRequest(BaseModel):
 def startup_event():
     init_db()
     seed_test_license()
+    print("STARTUP ENV DEBUG:", smtp_config_debug())
 
 
 # =============================
@@ -560,6 +645,14 @@ def root():
         "ok": True,
         "service": "mt5 copier api",
         "time": utc_now().isoformat()
+    }
+
+
+@app.get("/debug/env")
+def debug_env():
+    return {
+        "ok": True,
+        "env": smtp_config_debug()
     }
 
 
@@ -655,16 +748,23 @@ def slave_pull(payload: SlavePullRequest):
 
 
 # =============================
-# Protected Admin Auth
+# Admin Auth
 # =============================
 @app.post("/admin/login/start")
 def admin_login_start(payload: AdminLoginStartRequest):
     cleanup_expired_login_challenges()
 
-    if payload.username != ADMIN_USERNAME or payload.password != ADMIN_PASSWORD:
+    if payload.username != get_admin_username() or payload.password != get_admin_password():
         return {
             "ok": False,
             "message": "Invalid username or password"
+        }
+
+    otp_email = get_admin_otp_email()
+    if not otp_email:
+        return {
+            "ok": False,
+            "message": "Missing ADMIN_OTP_EMAIL"
         }
 
     code = f"{secrets.randbelow(1000000):06d}"
@@ -678,19 +778,20 @@ def admin_login_start(payload: AdminLoginStartRequest):
         "attempts": 0
     }
 
-    sent_ok, sent_message = send_email_code(ADMIN_OTP_EMAIL, code)
+    sent_ok, sent_message = send_email_code(otp_email, code)
     if not sent_ok:
         del ADMIN_LOGIN_CHALLENGES[challenge_id]
         return {
             "ok": False,
-            "message": sent_message
+            "message": sent_message,
+            "debug": smtp_config_debug()
         }
 
     return {
         "ok": True,
         "message": "Verification code sent",
         "challenge_id": challenge_id,
-        "email_hint": ADMIN_OTP_EMAIL
+        "email_hint": otp_email
     }
 
 
@@ -766,7 +867,7 @@ def admin_logout(x_admin_token: Optional[str] = Header(None)):
 
 
 # =============================
-# Protected Admin API
+# Admin API
 # =============================
 @app.get("/admin/dashboard")
 def admin_dashboard(x_admin_token: Optional[str] = Header(None)):
@@ -850,10 +951,7 @@ def admin_live_clients_text(x_admin_token: Optional[str] = Header(None)):
     while len(lines) < 5:
         lines.append("-")
 
-    return {
-        "ok": True,
-        "lines": lines
-    }
+    return {"ok": True, "lines": lines}
 
 
 @app.get("/admin/licenses")
@@ -946,10 +1044,7 @@ def admin_list_licenses(q: str = "", x_admin_token: Optional[str] = Header(None)
         item["time_left_seconds"] = time_left_seconds(item["expires_at"])
         items.append(item)
 
-    return {
-        "ok": True,
-        "licenses": items
-    }
+    return {"ok": True, "licenses": items}
 
 
 @app.get("/admin/license/{license_key}")
@@ -1128,11 +1223,7 @@ def admin_reset_activations(license_key: str, x_admin_token: Optional[str] = Hea
     conn.commit()
     conn.close()
 
-    return {
-        "ok": True,
-        "message": "Activations reset",
-        "deleted": deleted
-    }
+    return {"ok": True, "message": "Activations reset", "deleted": deleted}
 
 
 @app.delete("/admin/license/{license_key}")
@@ -1150,11 +1241,7 @@ def admin_delete_license(license_key: str, x_admin_token: Optional[str] = Header
     conn.commit()
     conn.close()
 
-    return {
-        "ok": True,
-        "message": "License deleted",
-        "license_key": license_key
-    }
+    return {"ok": True, "message": "License deleted", "license_key": license_key}
 
 
 @app.get("/admin/activations")
@@ -1188,10 +1275,7 @@ def admin_list_activations(x_admin_token: Optional[str] = Header(None)):
         item["client_status"] = online_status_from_last_seen(item["last_seen_at"])
         items.append(item)
 
-    return {
-        "ok": True,
-        "activations": items
-    }
+    return {"ok": True, "activations": items}
 
 
 @app.get("/admin/online-clients")
@@ -1231,14 +1315,11 @@ def admin_online_clients(x_admin_token: Optional[str] = Header(None)):
         item["time_left_seconds"] = time_left_seconds(item["expires_at"])
         items.append(item)
 
-    return {
-        "ok": True,
-        "clients": items
-    }
+    return {"ok": True, "clients": items}
 
 
 # =============================
-# Admin Panel HTML
+# Admin HTML
 # =============================
 @app.get("/admin-panel", response_class=HTMLResponse)
 def admin_panel():
