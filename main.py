@@ -5,6 +5,9 @@ from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 import sqlite3
 import secrets
+import os
+import smtplib
+from email.mime.text import MIMEText
 
 
 app = FastAPI(
@@ -16,9 +19,23 @@ app = FastAPI(
 
 DB_PATH = "licenses.db"
 
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "rcx123"
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "rcx123")
+ADMIN_OTP_EMAIL = os.getenv("ADMIN_OTP_EMAIL", "")
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USERNAME)
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+
 ADMIN_SESSIONS = {}
+ADMIN_LOGIN_CHALLENGES = {}
+
+ADMIN_SESSION_TTL_MINUTES = 30
+ADMIN_OTP_TTL_MINUTES = 5
+ADMIN_OTP_MAX_ATTEMPTS = 3
 
 LATEST_SNAPSHOT = {
     "snapshot_id": "",
@@ -106,6 +123,79 @@ def effective_license_status(db_status: str, expires_at: Optional[str]) -> str:
     if expires_at and time_left_seconds(expires_at) is not None and time_left_seconds(expires_at) <= 0:
         return "expired"
     return "active"
+
+
+def send_email_code(to_email: str, code: str) -> tuple[bool, str]:
+    if not to_email:
+        return False, "Missing ADMIN_OTP_EMAIL"
+    if not SMTP_HOST or not SMTP_FROM:
+        return False, "SMTP is not configured"
+
+    subject = "Your admin verification code"
+    body = f"Your verification code is: {code}\n\nThis code expires in {ADMIN_OTP_TTL_MINUTES} minutes."
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            if SMTP_USE_TLS:
+                server.starttls()
+            if SMTP_USERNAME:
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, [to_email], msg.as_string())
+        return True, "Verification code sent"
+    except Exception as e:
+        return False, f"Failed to send verification email: {str(e)}"
+
+
+def create_admin_session_token():
+    return secrets.token_hex(24)
+
+
+def create_login_challenge_id():
+    return secrets.token_hex(16)
+
+
+def cleanup_expired_login_challenges():
+    now = utc_now()
+    expired_ids = []
+    for cid, item in ADMIN_LOGIN_CHALLENGES.items():
+        exp = item.get("expires_at")
+        if exp is None or exp < now:
+            expired_ids.append(cid)
+    for cid in expired_ids:
+        del ADMIN_LOGIN_CHALLENGES[cid]
+
+
+def cleanup_expired_admin_sessions():
+    now = utc_now()
+    expired_tokens = []
+    for token, sess in ADMIN_SESSIONS.items():
+        last_seen = sess.get("last_seen_at")
+        if last_seen is None:
+            expired_tokens.append(token)
+            continue
+        if last_seen + timedelta(minutes=ADMIN_SESSION_TTL_MINUTES) < now:
+            expired_tokens.append(token)
+
+    for token in expired_tokens:
+        del ADMIN_SESSIONS[token]
+
+
+def require_admin_token(x_admin_token: Optional[str]):
+    cleanup_expired_admin_sessions()
+
+    if not x_admin_token:
+        raise HTTPException(status_code=401, detail="Missing admin token")
+
+    sess = ADMIN_SESSIONS.get(x_admin_token)
+    if not sess:
+        raise HTTPException(status_code=401, detail="Invalid or expired admin token")
+
+    sess["last_seen_at"] = utc_now()
 
 
 # =============================
@@ -374,23 +464,17 @@ def validate_license_simple(license_key: str):
     return True, "License is valid", lic
 
 
-def create_admin_session_token():
-    return secrets.token_hex(24)
-
-
-def require_admin_token(x_admin_token: Optional[str]):
-    if not x_admin_token:
-        raise HTTPException(status_code=401, detail="Missing admin token")
-    if x_admin_token not in ADMIN_SESSIONS:
-        raise HTTPException(status_code=401, detail="Invalid admin token")
-
-
 # =============================
 # Models
 # =============================
-class AdminLoginRequest(BaseModel):
+class AdminLoginStartRequest(BaseModel):
     username: str
     password: str
+
+
+class AdminLoginVerifyRequest(BaseModel):
+    challenge_id: str
+    code: str
 
 
 class PositionItem(BaseModel):
@@ -571,26 +655,91 @@ def slave_pull(payload: SlavePullRequest):
 
 
 # =============================
-# Protected Admin API
+# Protected Admin Auth
 # =============================
-@app.post("/admin/login")
-def admin_login(payload: AdminLoginRequest):
+@app.post("/admin/login/start")
+def admin_login_start(payload: AdminLoginStartRequest):
+    cleanup_expired_login_challenges()
+
     if payload.username != ADMIN_USERNAME or payload.password != ADMIN_PASSWORD:
         return {
             "ok": False,
             "message": "Invalid username or password"
         }
 
+    code = f"{secrets.randbelow(1000000):06d}"
+    challenge_id = create_login_challenge_id()
+    expires_at = utc_now() + timedelta(minutes=ADMIN_OTP_TTL_MINUTES)
+
+    ADMIN_LOGIN_CHALLENGES[challenge_id] = {
+        "username": payload.username,
+        "code": code,
+        "expires_at": expires_at,
+        "attempts": 0
+    }
+
+    sent_ok, sent_message = send_email_code(ADMIN_OTP_EMAIL, code)
+    if not sent_ok:
+        del ADMIN_LOGIN_CHALLENGES[challenge_id]
+        return {
+            "ok": False,
+            "message": sent_message
+        }
+
+    return {
+        "ok": True,
+        "message": "Verification code sent",
+        "challenge_id": challenge_id,
+        "email_hint": ADMIN_OTP_EMAIL
+    }
+
+
+@app.post("/admin/login/verify")
+def admin_login_verify(payload: AdminLoginVerifyRequest):
+    cleanup_expired_login_challenges()
+    cleanup_expired_admin_sessions()
+
+    item = ADMIN_LOGIN_CHALLENGES.get(payload.challenge_id)
+    if not item:
+        return {
+            "ok": False,
+            "message": "Invalid or expired challenge"
+        }
+
+    if item["attempts"] >= ADMIN_OTP_MAX_ATTEMPTS:
+        del ADMIN_LOGIN_CHALLENGES[payload.challenge_id]
+        return {
+            "ok": False,
+            "message": "Too many invalid code attempts"
+        }
+
+    if utc_now() > item["expires_at"]:
+        del ADMIN_LOGIN_CHALLENGES[payload.challenge_id]
+        return {
+            "ok": False,
+            "message": "Verification code expired"
+        }
+
+    if payload.code.strip() != item["code"]:
+        item["attempts"] += 1
+        return {
+            "ok": False,
+            "message": "Invalid verification code"
+        }
+
     token = create_admin_session_token()
     ADMIN_SESSIONS[token] = {
-        "username": payload.username,
-        "created_at": utc_now_str()
+        "username": item["username"],
+        "created_at": utc_now(),
+        "last_seen_at": utc_now()
     }
+
+    del ADMIN_LOGIN_CHALLENGES[payload.challenge_id]
 
     return {
         "ok": True,
         "token": token,
-        "username": payload.username
+        "username": item["username"]
     }
 
 
@@ -601,18 +750,24 @@ def admin_me(x_admin_token: Optional[str] = Header(None)):
     return {
         "ok": True,
         "username": sess.get("username", "admin"),
-        "created_at": sess.get("created_at", "")
+        "created_at": sess.get("created_at", utc_now()).strftime("%Y-%m-%d %H:%M:%S"),
+        "last_seen_at": sess.get("last_seen_at", utc_now()).strftime("%Y-%m-%d %H:%M:%S")
     }
 
 
 @app.post("/admin/logout")
 def admin_logout(x_admin_token: Optional[str] = Header(None)):
-    require_admin_token(x_admin_token)
-    if x_admin_token in ADMIN_SESSIONS:
+    cleanup_expired_admin_sessions()
+
+    if x_admin_token and x_admin_token in ADMIN_SESSIONS:
         del ADMIN_SESSIONS[x_admin_token]
+
     return {"ok": True}
 
 
+# =============================
+# Protected Admin API
+# =============================
 @app.get("/admin/dashboard")
 def admin_dashboard(x_admin_token: Optional[str] = Header(None)):
     require_admin_token(x_admin_token)
@@ -1111,9 +1266,7 @@ def admin_panel():
         th.sortable { cursor:pointer; user-select:none; white-space:nowrap; }
         th.sortable:hover { background:#f3f4f6; }
         .row { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; }
-        .row2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
         .small { color:#555; font-size:13px; }
-        .muted { color:#666; }
         .hidden { display:none; }
         pre { background:#111827; color:#e5e7eb; padding:12px; border-radius:8px; overflow:auto; }
         .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; gap:12px; flex-wrap:wrap; }
@@ -1146,22 +1299,35 @@ def admin_panel():
         @media (max-width: 1100px) {
             .metric-grid { grid-template-columns:repeat(2,1fr); }
             .row { grid-template-columns:1fr; }
-            .row2 { grid-template-columns:1fr; }
         }
     </style>
 </head>
 <body>
     <div id="loginView" class="card" style="max-width:520px;margin:80px auto;">
         <h2>Admin Login</h2>
-        <div>
-            <label>Username</label>
-            <input id="adminUsername" type="text" placeholder="Username">
+
+        <div id="step1">
+            <div>
+                <label>Username</label>
+                <input id="adminUsername" type="text" placeholder="Username">
+            </div>
+            <div>
+                <label>Password</label>
+                <input id="adminPassword" type="password" placeholder="Password">
+            </div>
+            <button onclick="startLogin()">Send verification code</button>
         </div>
-        <div>
-            <label>Password</label>
-            <input id="adminPassword" type="password" placeholder="Password">
+
+        <div id="step2" class="hidden">
+            <div class="small" id="otpInfo"></div>
+            <div>
+                <label>Verification Code</label>
+                <input id="adminOtpCode" type="text" placeholder="6-digit code">
+            </div>
+            <button onclick="verifyLogin()">Verify and login</button>
+            <button class="gray" onclick="backToStep1()">Back</button>
         </div>
-        <button onclick="loginAdmin()">Login</button>
+
         <pre id="loginResult"></pre>
     </div>
 
@@ -1170,7 +1336,7 @@ def admin_panel():
             <div>
                 <h1>MT5 Copier Admin Panel</h1>
                 <div class="small" id="welcomeBar"></div>
-                <div class="tiny">Auto refresh every 15 seconds</div>
+                <div class="tiny">Auto refresh every 15 seconds while this page stays open</div>
             </div>
             <div class="toolbar">
                 <button class="gray" onclick="loadAll()">Refresh now</button>
@@ -1335,35 +1501,37 @@ def admin_panel():
 
 <script>
 let autoRefreshHandle = null;
+let adminToken = "";
+let loginChallengeId = "";
 
 function getToken() {
-    return localStorage.getItem("admin_token") || "";
+    return adminToken;
 }
 
 function setToken(token) {
-    localStorage.setItem("admin_token", token);
+    adminToken = token;
 }
 
 function clearToken() {
-    localStorage.removeItem("admin_token");
+    adminToken = "";
 }
 
 async function apiGet(url) {
     const token = getToken();
     const res = await fetch(url, {
-        headers: { "x-admin-token": token }
+        headers: token ? { "x-admin-token": token } : {}
     });
     return await res.json();
 }
 
 async function apiPost(url, data = {}) {
     const token = getToken();
+    const headers = { "Content-Type": "application/json" };
+    if (token) headers["x-admin-token"] = token;
+
     const res = await fetch(url, {
         method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            "x-admin-token": token
-        },
+        headers,
         body: JSON.stringify(data)
     });
     return await res.json();
@@ -1371,9 +1539,12 @@ async function apiPost(url, data = {}) {
 
 async function apiDelete(url) {
     const token = getToken();
+    const headers = {};
+    if (token) headers["x-admin-token"] = token;
+
     const res = await fetch(url, {
         method: "DELETE",
-        headers: { "x-admin-token": token }
+        headers
     });
     return await res.json();
 }
@@ -1382,6 +1553,10 @@ function showLoginOnly() {
     document.getElementById("loginView").classList.remove("hidden");
     document.getElementById("appView").classList.add("hidden");
     stopAutoRefresh();
+    clearToken();
+    loginChallengeId = "";
+    document.getElementById("step1").classList.remove("hidden");
+    document.getElementById("step2").classList.add("hidden");
 }
 
 function showAppOnly() {
@@ -1406,54 +1581,48 @@ function stopAutoRefresh() {
     }
 }
 
-async function verifySessionAndLoad() {
-    const token = getToken();
-    if (!token) {
-        showLoginOnly();
-        return;
-    }
-
-    const me = await apiGet("/admin/me");
-    if (!me.ok) {
-        clearToken();
-        showLoginOnly();
-        return;
-    }
-
-    document.getElementById("welcomeBar").textContent =
-        "Logged in as " + me.username + " | Session created at " + (me.created_at || "-");
-
-    showAppOnly();
-    await loadAll();
+function backToStep1() {
+    loginChallengeId = "";
+    document.getElementById("step1").classList.remove("hidden");
+    document.getElementById("step2").classList.add("hidden");
 }
 
-async function loginAdmin() {
+async function startLogin() {
     const username = document.getElementById("adminUsername").value.trim();
     const password = document.getElementById("adminPassword").value.trim();
 
-    const res = await fetch("/admin/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password })
-    });
+    const result = await apiPost("/admin/login/start", { username, password });
+    document.getElementById("loginResult").textContent = JSON.stringify(result, null, 2);
 
-    const result = await res.json();
+    if (result.ok) {
+        loginChallengeId = result.challenge_id;
+        document.getElementById("otpInfo").textContent =
+            "Verification code sent to: " + (result.email_hint || "configured email");
+        document.getElementById("step1").classList.add("hidden");
+        document.getElementById("step2").classList.remove("hidden");
+    }
+}
+
+async function verifyLogin() {
+    const code = document.getElementById("adminOtpCode").value.trim();
+
+    const result = await apiPost("/admin/login/verify", {
+        challenge_id: loginChallengeId,
+        code: code
+    });
     document.getElementById("loginResult").textContent = JSON.stringify(result, null, 2);
 
     if (result.ok && result.token) {
         setToken(result.token);
-        await verifySessionAndLoad();
-    } else {
-        showLoginOnly();
+        document.getElementById("welcomeBar").textContent =
+            "Logged in as " + result.username;
+        showAppOnly();
+        await loadAll();
     }
 }
 
 async function logoutAdmin() {
-    const token = getToken();
-    if (token) {
-        await apiPost("/admin/logout", {});
-    }
-    clearToken();
+    await apiPost("/admin/logout", {});
     showLoginOnly();
 }
 
@@ -1513,6 +1682,7 @@ function sortItems(items, field, dir) {
 async function loadDashboard() {
     const result = await apiGet("/admin/dashboard");
     if (!result.ok) {
+        if (result.detail) showLoginOnly();
         document.getElementById("dashboardStats").innerHTML = "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
         return;
     }
@@ -1569,6 +1739,7 @@ async function loadLicenses() {
     const result = await apiGet("/admin/licenses?q=" + encodeURIComponent(q));
 
     if (!result.ok) {
+        if (result.detail) showLoginOnly();
         document.getElementById("licensesTable").innerHTML = "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
         return;
     }
@@ -1660,6 +1831,7 @@ async function loadOnlineClients() {
     const result = await apiGet("/admin/online-clients");
 
     if (!result.ok) {
+        if (result.detail) showLoginOnly();
         document.getElementById("onlineClientsTable").innerHTML = "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
         return;
     }
@@ -1707,6 +1879,7 @@ async function loadActivations() {
     const result = await apiGet("/admin/activations");
 
     if (!result.ok) {
+        if (result.detail) showLoginOnly();
         document.getElementById("activationsTable").innerHTML = "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
         return;
     }
@@ -1756,6 +1929,7 @@ async function loadAll() {
 async function openEditModal(licenseKey) {
     const result = await apiGet(`/admin/license/${encodeURIComponent(licenseKey)}`);
     if (!result.ok) {
+        if (result.detail) showLoginOnly();
         alert(result.message || "Failed to load license");
         return;
     }
@@ -1883,7 +2057,7 @@ function jsq(str) {
     return String(str ?? "").replaceAll("'", "\\\\'");
 }
 
-verifySessionAndLoad();
+showLoginOnly();
 </script>
 </body>
 </html>
