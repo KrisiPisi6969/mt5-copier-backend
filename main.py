@@ -1330,6 +1330,27 @@ def admin_panel():
     <meta charset="utf-8">
     <title>MT5 Copier Admin Panel</title>
     <style>
+
+.login-msg {
+    margin-top: 12px;
+    padding: 12px;
+    border-radius: 8px;
+    font-size: 14px;
+    display: none;
+}
+
+.login-msg.success {
+    background: #dcfce7;
+    color: #166534;
+    border: 1px solid #16a34a;
+}
+
+.login-msg.error {
+    background: #fee2e2;
+    color: #991b1b;
+    border: 1px solid #dc2626;
+}
+    
         body { font-family: Arial, sans-serif; background:#f5f7fb; margin:0; padding:24px; }
         h1,h2,h3 { margin-top:0; }
         .card { background:white; border-radius:12px; padding:16px; margin-bottom:16px; box-shadow:0 2px 10px rgba(0,0,0,0.08); }
@@ -1409,7 +1430,7 @@ def admin_panel():
             <button class="gray" onclick="backToStep1()">Back</button>
         </div>
 
-        <pre id="loginResult"></pre>
+        <div id="loginResult" class="login-msg"></div>
     </div>
 
     <div id="appView" class="hidden">
@@ -1585,6 +1606,14 @@ let autoRefreshHandle = null;
 let adminToken = "";
 let loginChallengeId = "";
 
+function showLoginMessage(text, type = "success") {
+    const el = document.getElementById("loginResult");
+
+    el.textContent = text;
+    el.className = "login-msg " + type;
+    el.style.display = "block";
+}
+
 function getToken() {
     return adminToken;
 }
@@ -1672,33 +1701,47 @@ async function startLogin() {
     const username = document.getElementById("adminUsername").value.trim();
     const password = document.getElementById("adminPassword").value.trim();
 
-    const result = await apiPost("/admin/login/start", { username, password });
-    document.getElementById("loginResult").textContent = JSON.stringify(result, null, 2);
+    const result = await apiPost("/admin/login/start", {
+        username: username,
+        password: password
+    });
 
     if (result.ok) {
         loginChallengeId = result.challenge_id;
+
         document.getElementById("otpInfo").textContent =
-            "Verification code sent to: " + (result.email_hint || "configured email");
+            "Verification code sent to: " + (result.email_hint || "your email");
+
         document.getElementById("step1").classList.add("hidden");
         document.getElementById("step2").classList.remove("hidden");
+
+        showLoginMessage("Verification code sent successfully.", "success");
+    } else {
+        showLoginMessage(result.message || "Invalid username or password.", "error");
     }
 }
 
-async function verifyLogin() {
-    const code = document.getElementById("adminOtpCode").value.trim();
+async function startLogin() {
+    const username = document.getElementById("adminUsername").value.trim();
+    const password = document.getElementById("adminPassword").value.trim();
 
-    const result = await apiPost("/admin/login/verify", {
-        challenge_id: loginChallengeId,
-        code: code
+    const result = await apiPost("/admin/login/start", {
+        username: username,
+        password: password
     });
-    document.getElementById("loginResult").textContent = JSON.stringify(result, null, 2);
 
-    if (result.ok && result.token) {
-        setToken(result.token);
-        document.getElementById("welcomeBar").textContent =
-            "Logged in as " + result.username;
-        showAppOnly();
-        await loadAll();
+    if (result.ok) {
+        loginChallengeId = result.challenge_id;
+
+        document.getElementById("otpInfo").textContent =
+            "Verification code sent to: " + (result.email_hint || "your email");
+
+        document.getElementById("step1").classList.add("hidden");
+        document.getElementById("step2").classList.remove("hidden");
+
+        showLoginMessage("Verification code sent successfully.", "success");
+    } else {
+        showLoginMessage(result.message || "Invalid username or password.", "error");
     }
 }
 
