@@ -1330,27 +1330,6 @@ def admin_panel():
     <meta charset="utf-8">
     <title>MT5 Copier Admin Panel</title>
     <style>
-
-.login-msg {
-    margin-top: 12px;
-    padding: 12px;
-    border-radius: 8px;
-    font-size: 14px;
-    display: none;
-}
-
-.login-msg.success {
-    background: #dcfce7;
-    color: #166534;
-    border: 1px solid #16a34a;
-}
-
-.login-msg.error {
-    background: #fee2e2;
-    color: #991b1b;
-    border: 1px solid #dc2626;
-}
-    
         body { font-family: Arial, sans-serif; background:#f5f7fb; margin:0; padding:24px; }
         h1,h2,h3 { margin-top:0; }
         .card { background:white; border-radius:12px; padding:16px; margin-bottom:16px; box-shadow:0 2px 10px rgba(0,0,0,0.08); }
@@ -1398,6 +1377,27 @@ def admin_panel():
         .metric { background:#f9fafb; border:1px solid #e5e7eb; border-radius:10px; padding:12px; }
         .metric .label { font-size:12px; color:#666; }
         .metric .value { font-size:18px; font-weight:bold; margin-top:4px; }
+
+        .login-msg {
+            margin-top: 12px;
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 14px;
+            display: none;
+        }
+
+        .login-msg.success {
+            background: #dcfce7;
+            color: #166534;
+            border: 1px solid #16a34a;
+        }
+
+        .login-msg.error {
+            background: #fee2e2;
+            color: #991b1b;
+            border: 1px solid #dc2626;
+        }
+
         @media (max-width: 1100px) {
             .metric-grid { grid-template-columns:repeat(2,1fr); }
             .row { grid-template-columns:1fr; }
@@ -1606,24 +1606,23 @@ let autoRefreshHandle = null;
 let adminToken = "";
 let loginChallengeId = "";
 
-function showLoginMessage(text, type = "success") {
-    const el = document.getElementById("loginResult");
-
-    el.textContent = text;
-    el.className = "login-msg " + type;
-    el.style.display = "block";
-}
-
 function getToken() {
-    return adminToken;
+    return adminToken || "";
 }
 
 function setToken(token) {
-    adminToken = token;
+    adminToken = token || "";
 }
 
 function clearToken() {
     adminToken = "";
+}
+
+function showLoginMessage(text, type = "success") {
+    const el = document.getElementById("loginResult");
+    el.textContent = text || "";
+    el.className = "login-msg " + type;
+    el.style.display = "block";
 }
 
 async function apiGet(url) {
@@ -1644,7 +1643,10 @@ async function apiPost(url, data = {}) {
         headers,
         body: JSON.stringify(data)
     });
-    return await res.json();
+
+    const json = await res.json();
+    console.log("apiPost", url, json);
+    return json;
 }
 
 async function apiDelete(url) {
@@ -1695,6 +1697,8 @@ function backToStep1() {
     loginChallengeId = "";
     document.getElementById("step1").classList.remove("hidden");
     document.getElementById("step2").classList.add("hidden");
+    showLoginMessage("", "success");
+    document.getElementById("loginResult").style.display = "none";
 }
 
 async function startLogin() {
@@ -1721,27 +1725,40 @@ async function startLogin() {
     }
 }
 
-async function startLogin() {
-    const username = document.getElementById("adminUsername").value.trim();
-    const password = document.getElementById("adminPassword").value.trim();
+async function verifyLogin() {
+    const code = document.getElementById("adminOtpCode").value.trim();
 
-    const result = await apiPost("/admin/login/start", {
-        username: username,
-        password: password
-    });
+    try {
+        const result = await apiPost("/admin/login/verify", {
+            challenge_id: loginChallengeId,
+            code: code
+        });
 
-    if (result.ok) {
-        loginChallengeId = result.challenge_id;
+        console.log("verifyLogin result:", result);
 
-        document.getElementById("otpInfo").textContent =
-            "Verification code sent to: " + (result.email_hint || "your email");
+        if (result.ok && result.token) {
+            setToken(result.token);
 
-        document.getElementById("step1").classList.add("hidden");
-        document.getElementById("step2").classList.remove("hidden");
+            const welcomeBar = document.getElementById("welcomeBar");
+            if (welcomeBar) {
+                welcomeBar.textContent = "Logged in as " + (result.username || "admin");
+            }
 
-        showLoginMessage("Verification code sent successfully.", "success");
-    } else {
-        showLoginMessage(result.message || "Invalid username or password.", "error");
+            showLoginMessage("Login successful.", "success");
+            showAppOnly();
+
+            try {
+                await loadAll();
+            } catch (e) {
+                console.error("loadAll error:", e);
+                showLoginMessage("Login succeeded, but dashboard failed to load.", "error");
+            }
+        } else {
+            showLoginMessage(result.message || "Invalid verification code.", "error");
+        }
+    } catch (e) {
+        console.error("verifyLogin error:", e);
+        showLoginMessage("Unexpected error during verification.", "error");
     }
 }
 
