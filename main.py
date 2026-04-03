@@ -29,8 +29,11 @@ LATEST_SNAPSHOT = {
 VALID_MASTER_TOKEN = "MASTER123"
 
 ADMIN_SESSIONS = {}
+ADMIN_LOGIN_CHALLENGES = {}
 
 ADMIN_SESSION_TTL_MINUTES = 30
+ADMIN_OTP_TTL_MINUTES = 5
+ADMIN_OTP_MAX_ATTEMPTS = 3
 
 
 # =============================
@@ -178,12 +181,104 @@ def effective_license_status(db_status: str, expires_at: Optional[str]) -> str:
     return "active"
 
 
+def smtp_config_debug() -> dict:
+    return {
+        "ADMIN_OTP_EMAIL": get_admin_otp_email(),
+        "SMTP_HOST": get_smtp_host(),
+        "SMTP_PORT": get_smtp_port(),
+        "SMTP_USERNAME": get_smtp_username(),
+        "SMTP_FROM": get_smtp_from(),
+        "SMTP_USE_TLS": get_smtp_use_tls(),
+        "HAS_SMTP_PASSWORD": get_smtp_password() != "",
+    }
+
+def send_email_code(to_email: str, code: str) -> tuple[bool, str]:
+    smtp_host = get_smtp_host()
+    smtp_port = get_smtp_port()
+    smtp_username = get_smtp_username()
+    smtp_password = get_smtp_password()
+    smtp_from = get_smtp_from()
+    smtp_use_tls = get_smtp_use_tls()
+
+    if not to_email:
+        return False, "Missing ADMIN_OTP_EMAIL"
+
+    if not smtp_host:
+        return False, "SMTP is not configured: missing SMTP_HOST"
+
+    if not smtp_from:
+        return False, "SMTP is not configured: missing SMTP_FROM or SMTP_USERNAME"
+
+    if not smtp_username:
+        return False, "SMTP is not configured: missing SMTP_USERNAME"
+
+    if not smtp_password:
+        return False, "SMTP is not configured: missing SMTP_PASSWORD"
+
+    subject = "Your admin verification code"
+    body = f"Your verification code is: {code}\n\nThis code expires in {ADMIN_OTP_TTL_MINUTES} minutes."
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = smtp_from
+    msg["To"] = to_email
+
+    server = None
+    try:
+        print(f"SMTP DEBUG: connecting to {smtp_host}:{smtp_port} tls={smtp_use_tls}")
+
+        server = smtplib.SMTP(smtp_host, smtp_port, timeout=10)
+        server.ehlo()
+
+        if smtp_use_tls:
+            print("SMTP DEBUG: starting TLS")
+            server.starttls()
+            server.ehlo()
+
+        print(f"SMTP DEBUG: logging in as {smtp_username}")
+        server.login(smtp_username, smtp_password)
+
+        print(f"SMTP DEBUG: sending mail to {to_email}")
+        server.sendmail(smtp_from, [to_email], msg.as_string())
+        print("SMTP DEBUG: mail sent OK")
+
+        return True, "Verification code sent"
+
+    except smtplib.SMTPAuthenticationError as e:
+        return False, f"SMTP auth failed: {str(e)}"
+    except smtplib.SMTPConnectError as e:
+        return False, f"SMTP connect failed: {str(e)}"
+    except smtplib.SMTPServerDisconnected as e:
+        return False, f"SMTP server disconnected: {str(e)}"
+    except TimeoutError:
+        return False, "SMTP timeout while connecting"
+    except Exception as e:
+        return False, f"Failed to send verification email: {str(e)}"
+    finally:
+        try:
+            if server is not None:
+                server.quit()
+        except Exception:
+            pass
 
 
 def create_admin_session_token():
     return secrets.token_hex(24)
 
 
+def create_login_challenge_id():
+    return secrets.token_hex(16)
+
+
+def cleanup_expired_login_challenges():
+    now = utc_now()
+    expired_ids = []
+    for cid, item in ADMIN_LOGIN_CHALLENGES.items():
+        exp = item.get("expires_at")
+        if exp is None or exp < now:
+            expired_ids.append(cid)
+    for cid in expired_ids:
+        del ADMIN_LOGIN_CHALLENGES[cid]
 
 
 def cleanup_expired_admin_sessions():
@@ -565,7 +660,7 @@ class AdminExtendLicenseRequest(BaseModel):
 def startup_event():
     init_db()
     seed_test_license()
-    
+    print("STARTUP ENV DEBUG:", smtp_config_debug())
 
 
 # =============================
@@ -682,14 +777,9 @@ def slave_pull(payload: SlavePullRequest):
 # =============================
 # Admin Auth
 # =============================
-
-
-
-
-
-@app.post("/admin/login")
-def admin_login(payload: AdminLoginStartRequest):
-    cleanup_expired_admin_sessions()
+@app.post("/admin/login/start")
+def admin_login_start(payload: AdminLoginStartRequest):
+    cleanup_expired_login_challenges()
 
     if payload.username != get_admin_username() or payload.password != get_admin_password():
         return {
@@ -697,19 +787,89 @@ def admin_login(payload: AdminLoginStartRequest):
             "message": "Invalid username or password"
         }
 
-    token = create_admin_session_token()
+    otp_email = get_admin_otp_email()
+    if not otp_email:
+        return {
+            "ok": False,
+            "message": "Missing ADMIN_OTP_EMAIL"
+        }
 
-    ADMIN_SESSIONS[token] = {
+    code = f"{secrets.randbelow(1000000):06d}"
+    challenge_id = create_login_challenge_id()
+    expires_at = utc_now() + timedelta(minutes=ADMIN_OTP_TTL_MINUTES)
+
+    ADMIN_LOGIN_CHALLENGES[challenge_id] = {
         "username": payload.username,
+        "code": code,
+        "expires_at": expires_at,
+        "attempts": 0
+    }
+
+    sent_ok, sent_message = send_email_code(otp_email, code)
+    if not sent_ok:
+        del ADMIN_LOGIN_CHALLENGES[challenge_id]
+        return {
+            "ok": False,
+            "message": sent_message,
+            "debug": smtp_config_debug()
+        }
+
+    return {
+        "ok": True,
+        "message": "Verification code sent",
+        "challenge_id": challenge_id,
+        "email_hint": otp_email
+    }
+
+
+@app.post("/admin/login/verify")
+def admin_login_verify(payload: AdminLoginVerifyRequest):
+    cleanup_expired_login_challenges()
+    cleanup_expired_admin_sessions()
+
+    item = ADMIN_LOGIN_CHALLENGES.get(payload.challenge_id)
+    if not item:
+        return {
+            "ok": False,
+            "message": "Invalid or expired challenge"
+        }
+
+    if item["attempts"] >= ADMIN_OTP_MAX_ATTEMPTS:
+        del ADMIN_LOGIN_CHALLENGES[payload.challenge_id]
+        return {
+            "ok": False,
+            "message": "Too many invalid code attempts"
+        }
+
+    if utc_now() > item["expires_at"]:
+        del ADMIN_LOGIN_CHALLENGES[payload.challenge_id]
+        return {
+            "ok": False,
+            "message": "Verification code expired"
+        }
+
+    if payload.code.strip() != item["code"]:
+        item["attempts"] += 1
+        return {
+            "ok": False,
+            "message": "Invalid verification code"
+        }
+
+    token = create_admin_session_token()
+    ADMIN_SESSIONS[token] = {
+        "username": item["username"],
         "created_at": utc_now(),
         "last_seen_at": utc_now()
     }
 
+    del ADMIN_LOGIN_CHALLENGES[payload.challenge_id]
+
     return {
         "ok": True,
         "token": token,
-        "username": payload.username
+        "username": item["username"]
     }
+
 
 @app.get("/admin/me")
 def admin_me(x_admin_token: Optional[str] = Header(None)):
