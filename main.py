@@ -192,8 +192,6 @@ def smtp_config_debug() -> dict:
         "HAS_SMTP_PASSWORD": get_smtp_password() != "",
     }
 
-
-def send_email_code(to_email: str, code: str) -> tuple[bool, str]:
 def send_email_code(to_email: str, code: str) -> tuple[bool, str]:
     smtp_host = get_smtp_host()
     smtp_port = get_smtp_port()
