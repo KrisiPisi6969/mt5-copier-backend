@@ -1464,7 +1464,7 @@ def admin_panel():
                 </div>
                 <div>
                     <label>Expires At</label>
-                    <input id="createExpiresAt" value="2026-12-31 23:59:59">
+                    <input id="createExpiresAt" type="datatime-local">
                 </div>
             </div>
             <div class="row">
@@ -1844,7 +1844,9 @@ async function loadDashboard() {
 async function createLicense() {
     const license_key = document.getElementById("createLicenseKey").value.trim();
     const name = document.getElementById("createName").value.trim();
-    const expires_at = document.getElementById("createExpiresAt").value.trim();
+    const expires_at = localInputValueToUtcString(
+    document.getElementById("createExpiresAt").value.trim()
+);
     const max_accounts = parseInt(document.getElementById("createMaxAccounts").value.trim() || "1");
     const note = document.getElementById("createNote").value.trim();
 
@@ -1914,7 +1916,7 @@ async function loadLicenses() {
             <td class="mono">${escapeHtml(lic.license_key)}</td>
             <td>${licenseStatusBadge(lic.effective_status)}</td>
             <td>${clientStatusBadge(lic.client_status)}</td>
-            <td class="nowrap">${escapeHtml(lic.expires_at || "")}</td>
+            <td class="nowrap">${escapeHtml(utcToLocalDisplay)(lic.expires_at || "")}</td>
             <td class="nowrap">${escapeHtml(lic.time_left_text || "-")}</td>
             <td>${lic.max_accounts}</td>
             <td>${escapeHtml(lic.latest_account_login || "")}</td>
@@ -2080,7 +2082,7 @@ async function openEditModal(licenseKey) {
     document.getElementById("editLicenseKey").value = lic.license_key || "";
     document.getElementById("editName").value = lic.name || "";
     document.getElementById("editStatus").value = lic.status || "active";
-    document.getElementById("editExpiresAt").value = lic.expires_at || "";
+    document.getElementById("editExpiresAt").value = utcToLocalInputValue(lic.expires_at || "");
     document.getElementById("editMaxAccounts").value = lic.max_accounts || 1;
     document.getElementById("editNote").value = lic.note || "";
     document.getElementById("editTimeLeft").value = lic.time_left_text || "-";
@@ -2120,7 +2122,7 @@ async function saveLicenseEdit() {
         new_license_key: document.getElementById("editLicenseKey").value.trim(),
         name: document.getElementById("editName").value.trim(),
         status: document.getElementById("editStatus").value,
-        expires_at: document.getElementById("editExpiresAt").value.trim(),
+        expires_at: localInputValueToUtcString(document.getElementById("editExpiresAt").value.trim()),
         max_accounts: parseInt(document.getElementById("editMaxAccounts").value.trim() || "1"),
         note: document.getElementById("editNote").value.trim()
     };
@@ -2183,6 +2185,46 @@ async function copyLicense(licenseKey) {
 async function copyCurrentLicense() {
     const key = document.getElementById("editLicenseKey").value.trim();
     if (key) await copyLicense(key);
+}
+
+function pad2(n) {
+    return String(n).padStart(2, "0");
+}
+
+function utcToLocalInputValue(utcString) {
+    if (!utcString) return "";
+
+    const d = new Date(utcString.replace(" ", "T") + "Z");
+
+    const year = d.getFullYear();
+    const month = pad2(d.getMonth() + 1);
+    const day = pad2(d.getDate());
+    const hours = pad2(d.getHours());
+    const mins = pad2(d.getMinutes());
+
+    return `${year}-${month}-${day}T${hours}:${mins}`;
+}
+
+function localInputValueToUtcString(localValue) {
+    if (!localValue) return "";
+
+    const d = new Date(localValue);
+    if (isNaN(d.getTime())) return "";
+
+    const year = d.getUTCFullYear();
+    const month = pad2(d.getUTCMonth() + 1);
+    const day = pad2(d.getUTCDate());
+    const hours = pad2(d.getUTCHours());
+    const mins = pad2(d.getUTCMinutes());
+    const secs = pad2(d.getUTCSeconds());
+
+    return `${year}-${month}-${day} ${hours}:${mins}:${secs}`;
+}
+
+function utcToLocalDisplay(utcString) {
+    if (!utcString) return "";
+    const d = new Date(utcString.replace(" ", "T") + "Z");
+    return d.toLocaleString();
 }
 
 function escapeHtml(str) {
