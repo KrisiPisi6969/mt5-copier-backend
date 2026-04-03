@@ -39,6 +39,9 @@ ADMIN_OTP_MAX_ATTEMPTS = 3
 # =============================
 # ENV helpers
 # =============================
+def get_admin_otp_enabled() -> bool:
+    return env_bool("ADMIN_OTP_ENABLED", False)
+
 def env_str(name: str, default: str = "") -> str:
     value = os.getenv(name, default)
     if value is None:
@@ -787,6 +790,23 @@ def admin_login_start(payload: AdminLoginStartRequest):
             "message": "Invalid username or password"
         }
 
+    # Ако OTP е изключен -> директен login challenge bypass
+    if not get_admin_otp_enabled():
+        token = create_admin_session_token()
+        ADMIN_SESSIONS[token] = {
+            "username": payload.username,
+            "created_at": utc_now(),
+            "last_seen_at": utc_now()
+        }
+
+        return {
+            "ok": True,
+            "message": "Login successful (OTP disabled)",
+            "token": token,
+            "username": payload.username,
+            "otp_required": False
+        }
+
     otp_email = get_admin_otp_email()
     if not otp_email:
         return {
@@ -818,9 +838,9 @@ def admin_login_start(payload: AdminLoginStartRequest):
         "ok": True,
         "message": "Verification code sent",
         "challenge_id": challenge_id,
-        "email_hint": otp_email
+        "email_hint": otp_email,
+        "otp_required": True
     }
-
 
 @app.post("/admin/login/verify")
 def admin_login_verify(payload: AdminLoginVerifyRequest):
@@ -1781,6 +1801,22 @@ async function startLogin() {
     });
 
     if (result.ok) {
+        // OTP изключен -> директен вход
+        if (result.token) {
+            setToken(result.token);
+
+            const welcomeBar = document.getElementById("welcomeBar");
+            if (welcomeBar) {
+                welcomeBar.textContent = "Logged in as " + (result.username || "admin");
+            }
+
+            showLoginMessage(result.message || "Login successful.", "success");
+            showAppOnly();
+            await loadAll();
+            return;
+        }
+
+        // OTP включен -> минаваш на стъпка 2
         loginChallengeId = result.challenge_id;
 
         document.getElementById("otpInfo").textContent =
