@@ -194,6 +194,7 @@ def smtp_config_debug() -> dict:
 
 
 def send_email_code(to_email: str, code: str) -> tuple[bool, str]:
+def send_email_code(to_email: str, code: str) -> tuple[bool, str]:
     smtp_host = get_smtp_host()
     smtp_port = get_smtp_port()
     smtp_username = get_smtp_username()
@@ -210,6 +211,12 @@ def send_email_code(to_email: str, code: str) -> tuple[bool, str]:
     if not smtp_from:
         return False, "SMTP is not configured: missing SMTP_FROM or SMTP_USERNAME"
 
+    if not smtp_username:
+        return False, "SMTP is not configured: missing SMTP_USERNAME"
+
+    if not smtp_password:
+        return False, "SMTP is not configured: missing SMTP_PASSWORD"
+
     subject = "Your admin verification code"
     body = f"Your verification code is: {code}\n\nThis code expires in {ADMIN_OTP_TTL_MINUTES} minutes."
 
@@ -218,21 +225,43 @@ def send_email_code(to_email: str, code: str) -> tuple[bool, str]:
     msg["From"] = smtp_from
     msg["To"] = to_email
 
+    server = None
     try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+        print(f"SMTP DEBUG: connecting to {smtp_host}:{smtp_port} tls={smtp_use_tls}")
+
+        server = smtplib.SMTP(smtp_host, smtp_port, timeout=10)
+        server.ehlo()
+
+        if smtp_use_tls:
+            print("SMTP DEBUG: starting TLS")
+            server.starttls()
             server.ehlo()
-            if smtp_use_tls:
-                server.starttls()
-                server.ehlo()
 
-            if smtp_username:
-                server.login(smtp_username, smtp_password)
+        print(f"SMTP DEBUG: logging in as {smtp_username}")
+        server.login(smtp_username, smtp_password)
 
-            server.sendmail(smtp_from, [to_email], msg.as_string())
+        print(f"SMTP DEBUG: sending mail to {to_email}")
+        server.sendmail(smtp_from, [to_email], msg.as_string())
+        print("SMTP DEBUG: mail sent OK")
 
         return True, "Verification code sent"
+
+    except smtplib.SMTPAuthenticationError as e:
+        return False, f"SMTP auth failed: {str(e)}"
+    except smtplib.SMTPConnectError as e:
+        return False, f"SMTP connect failed: {str(e)}"
+    except smtplib.SMTPServerDisconnected as e:
+        return False, f"SMTP server disconnected: {str(e)}"
+    except TimeoutError:
+        return False, "SMTP timeout while connecting"
     except Exception as e:
         return False, f"Failed to send verification email: {str(e)}"
+    finally:
+        try:
+            if server is not None:
+                server.quit()
+        except Exception:
+            pass
 
 
 def create_admin_session_token():
@@ -1464,7 +1493,8 @@ def admin_panel():
                 </div>
                 <div>
                     <label>Expires At</label>
-                    <input id="createExpiresAt" value="2026-12-31 23:59:59">
+                    <input id="createExpiresAt" type="datetime-local">
+                    <div class="tiny">Shown and entered in your local timezone</div>
                 </div>
             </div>
             <div class="row">
@@ -1565,7 +1595,8 @@ def admin_panel():
             <div class="row">
                 <div>
                     <label>Expires At</label>
-                    <input id="editExpiresAt">
+                    <input id="editExpiresAt" type="datetime-local">
+                    <div class="tiny">Shown and entered in your local timezone</div>
                 </div>
                 <div>
                     <label>Max Accounts</label>
@@ -1623,6 +1654,47 @@ function showLoginMessage(text, type = "success") {
     el.textContent = text || "";
     el.className = "login-msg " + type;
     el.style.display = "block";
+}
+
+function pad2(n) {
+    return String(n).padStart(2, "0");
+}
+
+function utcToLocalInputValue(utcString) {
+    if (!utcString) return "";
+    const d = new Date(utcString.replace(" ", "T") + "Z");
+    if (isNaN(d.getTime())) return "";
+
+    const year = d.getFullYear();
+    const month = pad2(d.getMonth() + 1);
+    const day = pad2(d.getDate());
+    const hours = pad2(d.getHours());
+    const mins = pad2(d.getMinutes());
+
+    return `${year}-${month}-${day}T${hours}:${mins}`;
+}
+
+function localInputValueToUtcString(localValue) {
+    if (!localValue) return "";
+
+    const d = new Date(localValue);
+    if (isNaN(d.getTime())) return "";
+
+    const year = d.getUTCFullYear();
+    const month = pad2(d.getUTCMonth() + 1);
+    const day = pad2(d.getUTCDate());
+    const hours = pad2(d.getUTCHours());
+    const mins = pad2(d.getUTCMinutes());
+    const secs = pad2(d.getUTCSeconds());
+
+    return `${year}-${month}-${day} ${hours}:${mins}:${secs}`;
+}
+
+function utcToLocalDisplay(utcString) {
+    if (!utcString) return "";
+    const d = new Date(utcString.replace(" ", "T") + "Z");
+    if (isNaN(d.getTime())) return utcString;
+    return d.toLocaleString();
 }
 
 async function apiGet(url) {
@@ -1837,14 +1909,16 @@ async function loadDashboard() {
             <div class="metric"><div class="label">Total Balance</div><div class="value">${safeNum(result.total_balance)}</div></div>
             <div class="metric"><div class="label">Total Equity</div><div class="value">${safeNum(result.total_equity)}</div></div>
         </div>
-        <div class="small" style="margin-top:10px;">Server time: <b>${escapeHtml(result.server_time)}</b></div>
+        <div class="small" style="margin-top:10px;">Server time: <b>${utcToLocalDisplay(result.server_time)}</b></div>
     `;
 }
 
 async function createLicense() {
     const license_key = document.getElementById("createLicenseKey").value.trim();
     const name = document.getElementById("createName").value.trim();
-    const expires_at = document.getElementById("createExpiresAt").value.trim();
+    const expires_at = localInputValueToUtcString(
+        document.getElementById("createExpiresAt").value.trim()
+    );
     const max_accounts = parseInt(document.getElementById("createMaxAccounts").value.trim() || "1");
     const note = document.getElementById("createNote").value.trim();
 
@@ -1914,14 +1988,14 @@ async function loadLicenses() {
             <td class="mono">${escapeHtml(lic.license_key)}</td>
             <td>${licenseStatusBadge(lic.effective_status)}</td>
             <td>${clientStatusBadge(lic.client_status)}</td>
-            <td class="nowrap">${escapeHtml(lic.expires_at || "")}</td>
+            <td class="nowrap">${escapeHtml(utcToLocalDisplay(lic.expires_at || ""))}</td>
             <td class="nowrap">${escapeHtml(lic.time_left_text || "-")}</td>
             <td>${lic.max_accounts}</td>
             <td>${escapeHtml(lic.latest_account_login || "")}</td>
             <td>${escapeHtml(lic.latest_broker_server || "")}</td>
             <td>${safeNum(lic.latest_balance)}</td>
             <td>${safeNum(lic.latest_equity)}</td>
-            <td class="nowrap">${escapeHtml(lic.last_seen_at || "")}</td>
+            <td class="nowrap">${escapeHtml(utcToLocalDisplay(lic.last_seen_at || ""))}</td>
             <td>${escapeHtml(lic.note || "")}</td>
             <td class="actions">
                 <button onclick="openEditModal('${jsq(lic.license_key)}')">Edit</button>
@@ -2005,9 +2079,9 @@ async function loadOnlineClients() {
           <td>${escapeHtml(row.broker_server || "")}</td>
           <td>${safeNum(row.balance)}</td>
           <td>${safeNum(row.equity)}</td>
-          <td class="nowrap">${escapeHtml(row.expires_at || "")}</td>
+          <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.expires_at || ""))}</td>
           <td class="nowrap">${escapeHtml(row.time_left_text || "-")}</td>
-          <td class="nowrap">${escapeHtml(row.last_seen_at || "")}</td>
+          <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.last_seen_at || ""))}</td>
           <td>${escapeHtml(row.note || "")}</td>
         </tr>
         `;
@@ -2051,8 +2125,8 @@ async function loadActivations() {
             <td>${escapeHtml(row.machine_id)}</td>
             <td>${safeNum(row.balance)}</td>
             <td>${safeNum(row.equity)}</td>
-            <td class="nowrap">${escapeHtml(row.created_at)}</td>
-            <td class="nowrap">${escapeHtml(row.last_seen_at)}</td>
+            <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.created_at))}</td>
+            <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.last_seen_at))}</td>
         </tr>
         `;
     }
@@ -2080,7 +2154,7 @@ async function openEditModal(licenseKey) {
     document.getElementById("editLicenseKey").value = lic.license_key || "";
     document.getElementById("editName").value = lic.name || "";
     document.getElementById("editStatus").value = lic.status || "active";
-    document.getElementById("editExpiresAt").value = lic.expires_at || "";
+    document.getElementById("editExpiresAt").value = utcToLocalInputValue(lic.expires_at || "");
     document.getElementById("editMaxAccounts").value = lic.max_accounts || 1;
     document.getElementById("editNote").value = lic.note || "";
     document.getElementById("editTimeLeft").value = lic.time_left_text || "-";
@@ -2095,8 +2169,8 @@ async function openEditModal(licenseKey) {
           <td>${escapeHtml(a.machine_id || "")}</td>
           <td>${safeNum(a.balance)}</td>
           <td>${safeNum(a.equity)}</td>
-          <td>${escapeHtml(a.created_at || "")}</td>
-          <td>${escapeHtml(a.last_seen_at || "")}</td>
+          <td>${escapeHtml(utcToLocalDisplay(a.created_at || ""))}</td>
+          <td>${escapeHtml(utcToLocalDisplay(a.last_seen_at || ""))}</td>
         </tr>`;
     }
     html += "</table>";
@@ -2120,7 +2194,7 @@ async function saveLicenseEdit() {
         new_license_key: document.getElementById("editLicenseKey").value.trim(),
         name: document.getElementById("editName").value.trim(),
         status: document.getElementById("editStatus").value,
-        expires_at: document.getElementById("editExpiresAt").value.trim(),
+        expires_at: localInputValueToUtcString(document.getElementById("editExpiresAt").value.trim()),
         max_accounts: parseInt(document.getElementById("editMaxAccounts").value.trim() || "1"),
         note: document.getElementById("editNote").value.trim()
     };
@@ -2140,7 +2214,6 @@ async function extendCurrentLicense(days) {
     const result = await apiPost(`/admin/license/${encodeURIComponent(key)}/extend`, { days });
     document.getElementById("editResult").textContent = JSON.stringify(result, null, 2);
     if (result.ok) {
-        document.getElementById("editExpiresAt").value = result.expires_at;
         await loadAll();
         await openEditModal(key);
     }
