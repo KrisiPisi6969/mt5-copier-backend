@@ -42,6 +42,7 @@ ADMIN_OTP_MAX_ATTEMPTS = 3
 def get_admin_otp_enabled() -> bool:
     return env_bool("ADMIN_OTP_ENABLED", False)
 
+
 def env_str(name: str, default: str = "") -> str:
     value = os.getenv(name, default)
     if value is None:
@@ -114,6 +115,17 @@ def utc_now():
 
 def utc_now_str():
     return utc_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def dt_str_to_unix(expires_at: Optional[str]) -> int:
+    if not expires_at:
+        return 0
+    try:
+        dt = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+        dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return 0
 
 
 def parse_utc_db_time(dt_str: Optional[str]) -> Optional[datetime]:
@@ -194,6 +206,7 @@ def smtp_config_debug() -> dict:
         "SMTP_USE_TLS": get_smtp_use_tls(),
         "HAS_SMTP_PASSWORD": get_smtp_password() != "",
     }
+
 
 def send_email_code(to_email: str, code: str) -> tuple[bool, str]:
     smtp_host = get_smtp_host()
@@ -716,6 +729,8 @@ def slave_activate(payload: SlaveActivateRequest):
         "mode": "db",
         "poll_seconds": 1,
         "expires_at": lic["expires_at"],
+        "expires_at_ts": dt_str_to_unix(lic["expires_at"]),
+        "server_time": int(datetime.now(timezone.utc).timestamp()),
         "max_accounts": lic["max_accounts"]
     }
 
@@ -842,6 +857,7 @@ def admin_login_start(payload: AdminLoginStartRequest):
         "otp_required": True
     }
 
+
 @app.post("/admin/login/verify")
 def admin_login_verify(payload: AdminLoginVerifyRequest):
     cleanup_expired_login_challenges()
@@ -955,7 +971,7 @@ def admin_dashboard(x_admin_token: Optional[str] = Header(None)):
         "online_clients": online_clients,
         "total_balance": total_balance,
         "total_equity": total_equity,
-        "server_time": utc_now_str()
+        "server_time": int(datetime.now(timezone.utc).timestamp())
     }
 
 
@@ -1708,10 +1724,20 @@ function localInputValueToUtcString(localValue) {
     return `${year}-${month}-${day} ${hours}:${mins}:${secs}`;
 }
 
-function utcToLocalDisplay(utcString) {
-    if (!utcString) return "";
-    const d = new Date(utcString.replace(" ", "T") + "Z");
-    if (isNaN(d.getTime())) return utcString;
+function utcToLocalDisplay(value) {
+    if (value === null || value === undefined || value === "") return "";
+
+    let d = null;
+
+    if (typeof value === "number") {
+        d = new Date(value * 1000);
+    } else if (/^\\d+$/.test(String(value))) {
+        d = new Date(Number(value) * 1000);
+    } else {
+        d = new Date(String(value).replace(" ", "T") + "Z");
+    }
+
+    if (isNaN(d.getTime())) return String(value);
     return d.toLocaleString();
 }
 
