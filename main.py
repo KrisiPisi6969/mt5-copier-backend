@@ -968,7 +968,6 @@ def admin_dashboard(x_admin_token: Optional[str] = Header(None)):
         "online_clients": online_clients,
         "total_balance": total_balance,
         "total_equity": total_equity,
-        "server_time": utc_now_str()
         "server_time": int(datetime.now(timezone.utc).timestamp())
     }
 
