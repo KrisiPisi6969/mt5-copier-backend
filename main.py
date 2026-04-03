@@ -39,6 +39,17 @@ ADMIN_OTP_MAX_ATTEMPTS = 3
 # =============================
 # ENV helpers
 # =============================
+
+def dt_str_to_unix(expires_at: Optional[str]) -> int:
+    if not expires_at:
+        return 0
+    try:
+        dt = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+        dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return 0
+
 def get_admin_otp_enabled() -> bool:
     return env_bool("ADMIN_OTP_ENABLED", False)
 
@@ -710,14 +721,16 @@ def slave_activate(payload: SlaveActivateRequest):
         float(payload.account_equity or 0.0)
     )
 
-    return {
-        "ok": True,
-        "message": message,
-        "mode": "db",
-        "poll_seconds": 1,
-        "expires_at": lic["expires_at"],
-        "max_accounts": lic["max_accounts"]
-    }
+return {
+    "ok": True,
+    "message": message,
+    "mode": "db",
+    "poll_seconds": 1,
+    "expires_at": lic["expires_at"],
+    "expires_at_ts": dt_str_to_unix(lic["expires_at"]),
+    "server_time": int(datetime.now(timezone.utc).timestamp()),
+    "max_accounts": lic["max_accounts"]
+}
 
 
 @app.post("/master/publish")
@@ -956,6 +969,7 @@ def admin_dashboard(x_admin_token: Optional[str] = Header(None)):
         "total_balance": total_balance,
         "total_equity": total_equity,
         "server_time": utc_now_str()
+        "server_time": int(datetime.now(timezone.utc).timestamp())
     }
 
 
