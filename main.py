@@ -246,7 +246,7 @@ def create_login_challenge_id():
 def cleanup_expired_login_challenges():
     now = utc_now()
     expired_ids = []
-    for cid, item in list(ADMIN_LOGIN_CHALLENGES.items()):
+    for cid, item in ADMIN_LOGIN_CHALLENGES.items():
         exp = item.get("expires_at")
         if exp is None or exp < now:
             expired_ids.append(cid)
@@ -257,7 +257,7 @@ def cleanup_expired_login_challenges():
 def cleanup_expired_admin_sessions():
     now = utc_now()
     expired_tokens = []
-    for token, sess in list(ADMIN_SESSIONS.items()):
+    for token, sess in ADMIN_SESSIONS.items():
         last_seen = sess.get("last_seen_at")
         if last_seen is None:
             expired_tokens.append(token)
@@ -1465,6 +1465,7 @@ def admin_panel():
                 <div>
                     <label>Expires At</label>
                     <input id="createExpiresAt" type="datetime-local">
+                    <div class="tiny">Shown and entered in your local timezone</div>
                 </div>
             </div>
             <div class="row">
@@ -1566,6 +1567,7 @@ def admin_panel():
                 <div>
                     <label>Expires At</label>
                     <input id="editExpiresAt" type="datetime-local">
+                    <div class="tiny">Shown and entered in your local timezone</div>
                 </div>
                 <div>
                     <label>Max Accounts</label>
@@ -1622,7 +1624,48 @@ function showLoginMessage(text, type = "success") {
     const el = document.getElementById("loginResult");
     el.textContent = text || "";
     el.className = "login-msg " + type;
-    el.style.display = text ? "block" : "none";
+    el.style.display = "block";
+}
+
+function pad2(n) {
+    return String(n).padStart(2, "0");
+}
+
+function utcToLocalInputValue(utcString) {
+    if (!utcString) return "";
+    const d = new Date(utcString.replace(" ", "T") + "Z");
+    if (isNaN(d.getTime())) return "";
+
+    const year = d.getFullYear();
+    const month = pad2(d.getMonth() + 1);
+    const day = pad2(d.getDate());
+    const hours = pad2(d.getHours());
+    const mins = pad2(d.getMinutes());
+
+    return `${year}-${month}-${day}T${hours}:${mins}`;
+}
+
+function localInputValueToUtcString(localValue) {
+    if (!localValue) return "";
+
+    const d = new Date(localValue);
+    if (isNaN(d.getTime())) return "";
+
+    const year = d.getUTCFullYear();
+    const month = pad2(d.getUTCMonth() + 1);
+    const day = pad2(d.getUTCDate());
+    const hours = pad2(d.getUTCHours());
+    const mins = pad2(d.getUTCMinutes());
+    const secs = pad2(d.getUTCSeconds());
+
+    return `${year}-${month}-${day} ${hours}:${mins}:${secs}`;
+}
+
+function utcToLocalDisplay(utcString) {
+    if (!utcString) return "";
+    const d = new Date(utcString.replace(" ", "T") + "Z");
+    if (isNaN(d.getTime())) return utcString;
+    return d.toLocaleString();
 }
 
 async function apiGet(url) {
@@ -1669,7 +1712,6 @@ function showLoginOnly() {
     loginChallengeId = "";
     document.getElementById("step1").classList.remove("hidden");
     document.getElementById("step2").classList.add("hidden");
-    document.getElementById("adminOtpCode").value = "";
 }
 
 function showAppOnly() {
@@ -1682,7 +1724,7 @@ function startAutoRefresh() {
     stopAutoRefresh();
     autoRefreshHandle = setInterval(() => {
         if (!document.getElementById("appView").classList.contains("hidden")) {
-            loadAll().catch(err => console.error("auto refresh error:", err));
+            loadAll();
         }
     }, 15000);
 }
@@ -1699,6 +1741,7 @@ function backToStep1() {
     document.getElementById("step1").classList.remove("hidden");
     document.getElementById("step2").classList.add("hidden");
     showLoginMessage("", "success");
+    document.getElementById("loginResult").style.display = "none";
 }
 
 async function startLogin() {
@@ -1763,11 +1806,7 @@ async function verifyLogin() {
 }
 
 async function logoutAdmin() {
-    try {
-        await apiPost("/admin/logout", {});
-    } catch (e) {
-        console.error("logout error:", e);
-    }
+    await apiPost("/admin/logout", {});
     showLoginOnly();
 }
 
@@ -1828,7 +1867,7 @@ async function loadDashboard() {
     const result = await apiGet("/admin/dashboard");
     if (!result.ok) {
         if (result.detail) showLoginOnly();
-        document.getElementById("dashboardStats").innerHTML = "<pre>" + escapeHtml(JSON.stringify(result, null, 2)) + "</pre>";
+        document.getElementById("dashboardStats").innerHTML = "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
         return;
     }
 
@@ -1841,7 +1880,7 @@ async function loadDashboard() {
             <div class="metric"><div class="label">Total Balance</div><div class="value">${safeNum(result.total_balance)}</div></div>
             <div class="metric"><div class="label">Total Equity</div><div class="value">${safeNum(result.total_equity)}</div></div>
         </div>
-        <div class="small" style="margin-top:10px;">Server time: <b>${escapeHtml(result.server_time)}</b></div>
+        <div class="small" style="margin-top:10px;">Server time: <b>${utcToLocalDisplay(result.server_time)}</b></div>
     `;
 }
 
@@ -1868,8 +1907,6 @@ async function createLicense() {
         document.getElementById("createLicenseKey").value = "";
         document.getElementById("createName").value = "";
         document.getElementById("createNote").value = "";
-        document.getElementById("createExpiresAt").value = "";
-        document.getElementById("createMaxAccounts").value = "1";
     }
 
     await loadAll();
@@ -1889,11 +1926,11 @@ async function loadLicenses() {
 
     if (!result.ok) {
         if (result.detail) showLoginOnly();
-        document.getElementById("licensesTable").innerHTML = "<pre>" + escapeHtml(JSON.stringify(result, null, 2)) + "</pre>";
+        document.getElementById("licensesTable").innerHTML = "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
         return;
     }
 
-    const items = sortItems(result.licenses || [], sortField, sortDir);
+    const items = sortItems(result.licenses, sortField, sortDir);
 
     let html = `
     <table>
@@ -1981,7 +2018,7 @@ async function loadOnlineClients() {
 
     if (!result.ok) {
         if (result.detail) showLoginOnly();
-        document.getElementById("onlineClientsTable").innerHTML = "<pre>" + escapeHtml(JSON.stringify(result, null, 2)) + "</pre>";
+        document.getElementById("onlineClientsTable").innerHTML = "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
         return;
     }
 
@@ -2002,7 +2039,7 @@ async function loadOnlineClients() {
         <th>Notes</th>
       </tr>
     `;
-    for (const row of (result.clients || [])) {
+    for (const row of result.clients) {
         html += `
         <tr>
           <td>${escapeHtml(row.name || "")}</td>
@@ -2029,7 +2066,7 @@ async function loadActivations() {
 
     if (!result.ok) {
         if (result.detail) showLoginOnly();
-        document.getElementById("activationsTable").innerHTML = "<pre>" + escapeHtml(JSON.stringify(result, null, 2)) + "</pre>";
+        document.getElementById("activationsTable").innerHTML = "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
         return;
     }
 
@@ -2048,7 +2085,7 @@ async function loadActivations() {
         <th>Last Seen</th>
       </tr>
     `;
-    for (const row of (result.activations || [])) {
+    for (const row of result.activations) {
         html += `
         <tr>
             <td>${escapeHtml(row.name || "")}</td>
@@ -2059,8 +2096,8 @@ async function loadActivations() {
             <td>${escapeHtml(row.machine_id)}</td>
             <td>${safeNum(row.balance)}</td>
             <td>${safeNum(row.equity)}</td>
-            <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.created_at || ""))}</td>
-            <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.last_seen_at || ""))}</td>
+            <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.created_at))}</td>
+            <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.last_seen_at))}</td>
         </tr>
         `;
     }
@@ -2095,7 +2132,7 @@ async function openEditModal(licenseKey) {
     document.getElementById("editResult").textContent = "";
 
     let html = "<table><tr><th>Account</th><th>Broker</th><th>Machine</th><th>Balance</th><th>Equity</th><th>Created</th><th>Last Seen</th></tr>";
-    for (const a of (result.activations || [])) {
+    for (const a of result.activations) {
         html += `
         <tr>
           <td>${escapeHtml(a.account_login || "")}</td>
@@ -2148,7 +2185,6 @@ async function extendCurrentLicense(days) {
     const result = await apiPost(`/admin/license/${encodeURIComponent(key)}/extend`, { days });
     document.getElementById("editResult").textContent = JSON.stringify(result, null, 2);
     if (result.ok) {
-        document.getElementById("editExpiresAt").value = utcToLocalInputValue(result.expires_at);
         await loadAll();
         await openEditModal(key);
     }
@@ -2193,48 +2229,6 @@ async function copyCurrentLicense() {
     if (key) await copyLicense(key);
 }
 
-function pad2(n) {
-    return String(n).padStart(2, "0");
-}
-
-function utcToLocalInputValue(utcString) {
-    if (!utcString) return "";
-
-    const d = new Date(utcString.replace(" ", "T") + "Z");
-    if (isNaN(d.getTime())) return "";
-
-    const year = d.getFullYear();
-    const month = pad2(d.getMonth() + 1);
-    const day = pad2(d.getDate());
-    const hours = pad2(d.getHours());
-    const mins = pad2(d.getMinutes());
-
-    return `${year}-${month}-${day}T${hours}:${mins}`;
-}
-
-function localInputValueToUtcString(localValue) {
-    if (!localValue) return "";
-
-    const d = new Date(localValue);
-    if (isNaN(d.getTime())) return "";
-
-    const year = d.getUTCFullYear();
-    const month = pad2(d.getUTCMonth() + 1);
-    const day = pad2(d.getUTCDate());
-    const hours = pad2(d.getUTCHours());
-    const mins = pad2(d.getUTCMinutes());
-    const secs = pad2(d.getUTCSeconds());
-
-    return `${year}-${month}-${day} ${hours}:${mins}:${secs}`;
-}
-
-function utcToLocalDisplay(utcString) {
-    if (!utcString) return "";
-    const d = new Date(utcString.replace(" ", "T") + "Z");
-    if (isNaN(d.getTime())) return utcString;
-    return d.toLocaleString();
-}
-
 function escapeHtml(str) {
     return String(str ?? "")
       .replaceAll("&", "&amp;")
@@ -2245,11 +2239,11 @@ function escapeHtml(str) {
 }
 
 function jsq(str) {
-    return String(str ?? "").replaceAll("\\\\", "\\\\\\\\").replaceAll("'", "\\\\'");
+    return String(str ?? "").replaceAll("'", "\\\\'");
 }
 
 showLoginOnly();
 </script>
 </body>
 </html>
-    """
+    
