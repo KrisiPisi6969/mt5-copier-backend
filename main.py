@@ -1464,7 +1464,7 @@ def admin_panel():
                 </div>
                 <div>
                     <label>Expires At</label>
-                    <input id="createExpiresAt" type="datatime-local">
+                    <input id="createExpiresAt" type="datetime-local">
                 </div>
             </div>
             <div class="row">
@@ -2142,7 +2142,7 @@ async function extendCurrentLicense(days) {
     const result = await apiPost(`/admin/license/${encodeURIComponent(key)}/extend`, { days });
     document.getElementById("editResult").textContent = JSON.stringify(result, null, 2);
     if (result.ok) {
-        document.getElementById("editExpiresAt").value = result.expires_at;
+        document.getElementById("editExpiresAt").value = utcToLocalInputValue(result.expires_at);
         await loadAll();
         await openEditModal(key);
     }
