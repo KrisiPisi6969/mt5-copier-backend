@@ -113,28 +113,67 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
+def utc_now_ts() -> int:
+    return int(utc_now().timestamp())
+
+
 def utc_now_str():
     return utc_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def dt_str_to_unix(expires_at: Optional[str]) -> int:
-    if not expires_at:
-        return 0
+def parse_datetime_to_utc(dt_value: Optional[str]) -> Optional[datetime]:
+    """
+    Normalizes several incoming datetime formats to timezone-aware UTC datetime.
+
+    Accepted examples:
+    - 2026-04-04 15:00:00        (already UTC DB/admin payload)
+    - 2026-04-04T15:00:00
+    - 2026-04-04T15:00:00Z
+    - 2026-04-04T18:00:00+03:00
+    """
+    if not dt_value:
+        return None
+
+    raw = str(dt_value).strip()
+    if raw == "":
+        return None
+
     try:
-        dt = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
-        dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
+        # Handle trailing Z explicitly
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+
+        # ISO datetime with offset
+        if "T" in raw or "+" in raw[10:] or raw.count("-") > 2:
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                # Treat naive admin/db strings as UTC
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+
+        # Standard DB format: UTC string
+        dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=timezone.utc)
     except Exception:
+        return None
+
+
+def normalize_utc_db_str(dt_value: Optional[str]) -> Optional[str]:
+    dt = parse_datetime_to_utc(dt_value)
+    if dt is None:
+        return None
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def dt_str_to_unix(expires_at: Optional[str]) -> int:
+    dt = parse_datetime_to_utc(expires_at)
+    if dt is None:
         return 0
+    return int(dt.timestamp())
 
 
 def parse_utc_db_time(dt_str: Optional[str]) -> Optional[datetime]:
-    if not dt_str:
-        return None
-    try:
-        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
+    return parse_datetime_to_utc(dt_str)
 
 
 def seconds_ago_from_str(dt_str: Optional[str]) -> int:
@@ -323,6 +362,23 @@ def require_admin_token(x_admin_token: Optional[str]):
         raise HTTPException(status_code=401, detail="Invalid or expired admin token")
 
     sess["last_seen_at"] = utc_now()
+
+
+def license_public_payload(lic) -> dict:
+    expires_at = lic["expires_at"]
+    return {
+        "license_key": lic["license_key"],
+        "name": lic["name"],
+        "status": lic["status"],
+        "effective_status": effective_license_status(lic["status"], expires_at),
+        "expires_at": expires_at,
+        "expires_at_ts": dt_str_to_unix(expires_at),
+        "time_left_text": format_time_left_human(expires_at),
+        "time_left_seconds": time_left_seconds(expires_at),
+        "max_accounts": lic["max_accounts"],
+        "note": lic["note"],
+        "created_at": lic["created_at"],
+    }
 
 
 # =============================
@@ -687,7 +743,8 @@ def root():
     return {
         "ok": True,
         "service": "mt5 copier api",
-        "time": utc_now().isoformat()
+        "time": utc_now().isoformat(),
+        "server_now_utc_ts": utc_now_ts()
     }
 
 
@@ -695,7 +752,8 @@ def root():
 def debug_env():
     return {
         "ok": True,
-        "env": smtp_config_debug()
+        "env": smtp_config_debug(),
+        "server_now_utc_ts": utc_now_ts()
     }
 
 
@@ -711,7 +769,8 @@ def slave_activate(payload: SlaveActivateRequest):
     if not ok:
         return {
             "ok": False,
-            "message": message
+            "message": message,
+            "server_now_utc_ts": utc_now_ts()
         }
 
     refresh_activation_seen(
@@ -723,14 +782,18 @@ def slave_activate(payload: SlaveActivateRequest):
         float(payload.account_equity or 0.0)
     )
 
+    expires_at_ts = dt_str_to_unix(lic["expires_at"])
+
     return {
         "ok": True,
         "message": message,
         "mode": "db",
         "poll_seconds": 1,
         "expires_at": lic["expires_at"],
-        "expires_at_ts": dt_str_to_unix(lic["expires_at"]),
-        "server_time": int(datetime.now(timezone.utc).timestamp()),
+        "expires_at_ts": expires_at_ts,
+        "server_time": utc_now_ts(),
+        "server_now_utc_ts": utc_now_ts(),
+        "time_left_seconds": time_left_seconds(lic["expires_at"]),
         "max_accounts": lic["max_accounts"]
     }
 
@@ -740,18 +803,21 @@ def master_publish(payload: MasterPublishRequest):
     if payload.master_token != VALID_MASTER_TOKEN:
         return {
             "ok": False,
-            "message": "Invalid master token"
+            "message": "Invalid master token",
+            "server_now_utc_ts": utc_now_ts()
         }
 
     LATEST_SNAPSHOT["snapshot_id"] = payload.snapshot_id
-    LATEST_SNAPSHOT["timestamp"] = int(utc_now().timestamp())
+    LATEST_SNAPSHOT["timestamp"] = utc_now_ts()
     LATEST_SNAPSHOT["positions"] = [p.model_dump() for p in payload.positions]
     LATEST_SNAPSHOT["pending_orders"] = [o.model_dump() for o in payload.pending_orders]
 
     return {
         "ok": True,
         "message": "Snapshot saved",
-        "snapshot_id": LATEST_SNAPSHOT["snapshot_id"]
+        "snapshot_id": LATEST_SNAPSHOT["snapshot_id"],
+        "timestamp": LATEST_SNAPSHOT["timestamp"],
+        "server_now_utc_ts": utc_now_ts()
     }
 
 
@@ -762,7 +828,8 @@ def slave_pull(payload: SlavePullRequest):
     if not ok:
         return {
             "ok": False,
-            "message": message
+            "message": message,
+            "server_now_utc_ts": utc_now_ts()
         }
 
     refresh_last_seen_by_license(
@@ -774,12 +841,21 @@ def slave_pull(payload: SlavePullRequest):
         payload.account_equity
     )
 
+    expires_at_ts = dt_str_to_unix(lic["expires_at"])
+    common = {
+        "expires_at": lic["expires_at"],
+        "expires_at_ts": expires_at_ts,
+        "server_now_utc_ts": utc_now_ts(),
+        "time_left_seconds": time_left_seconds(lic["expires_at"])
+    }
+
     if payload.last_snapshot_id == LATEST_SNAPSHOT["snapshot_id"]:
         return {
             "ok": True,
             "has_update": False,
             "snapshot_id": payload.last_snapshot_id,
-            "timestamp": LATEST_SNAPSHOT["timestamp"]
+            "timestamp": LATEST_SNAPSHOT["timestamp"],
+            **common
         }
 
     return {
@@ -788,7 +864,8 @@ def slave_pull(payload: SlavePullRequest):
         "snapshot_id": LATEST_SNAPSHOT["snapshot_id"],
         "timestamp": LATEST_SNAPSHOT["timestamp"],
         "positions": LATEST_SNAPSHOT["positions"],
-        "pending_orders": LATEST_SNAPSHOT["pending_orders"]
+        "pending_orders": LATEST_SNAPSHOT["pending_orders"],
+        **common
     }
 
 
@@ -805,7 +882,6 @@ def admin_login_start(payload: AdminLoginStartRequest):
             "message": "Invalid username or password"
         }
 
-    # Ако OTP е изключен -> директен login challenge bypass
     if not get_admin_otp_enabled():
         token = create_admin_session_token()
         ADMIN_SESSIONS[token] = {
@@ -891,9 +967,10 @@ def admin_login_verify(payload: AdminLoginVerifyRequest):
             "message": "Invalid verification code"
         }
 
+    username = item["username"]
     token = create_admin_session_token()
     ADMIN_SESSIONS[token] = {
-        "username": item["username"],
+        "username": username,
         "created_at": utc_now(),
         "last_seen_at": utc_now()
     }
@@ -903,7 +980,7 @@ def admin_login_verify(payload: AdminLoginVerifyRequest):
     return {
         "ok": True,
         "token": token,
-        "username": item["username"]
+        "username": username
     }
 
 
@@ -971,7 +1048,8 @@ def admin_dashboard(x_admin_token: Optional[str] = Header(None)):
         "online_clients": online_clients,
         "total_balance": total_balance,
         "total_equity": total_equity,
-        "server_time": int(datetime.now(timezone.utc).timestamp())
+        "server_time": utc_now_ts(),
+        "server_now_utc_ts": utc_now_ts()
     }
 
 
@@ -1014,7 +1092,7 @@ def admin_live_clients_text(x_admin_token: Optional[str] = Header(None)):
     while len(lines) < 5:
         lines.append("-")
 
-    return {"ok": True, "lines": lines}
+    return {"ok": True, "lines": lines, "server_now_utc_ts": utc_now_ts()}
 
 
 @app.get("/admin/licenses")
@@ -1105,9 +1183,10 @@ def admin_list_licenses(q: str = "", x_admin_token: Optional[str] = Header(None)
         item["client_status"] = online_status_from_last_seen(item["last_seen_at"])
         item["time_left_text"] = format_time_left_human(item["expires_at"])
         item["time_left_seconds"] = time_left_seconds(item["expires_at"])
+        item["expires_at_ts"] = dt_str_to_unix(item["expires_at"])
         items.append(item)
 
-    return {"ok": True, "licenses": items}
+    return {"ok": True, "licenses": items, "server_now_utc_ts": utc_now_ts()}
 
 
 @app.get("/admin/license/{license_key}")
@@ -1139,13 +1218,9 @@ def admin_get_license(license_key: str, x_admin_token: Optional[str] = Header(No
 
     return {
         "ok": True,
-        "license": {
-            **dict(lic),
-            "effective_status": effective_license_status(lic["status"], lic["expires_at"]),
-            "time_left_text": format_time_left_human(lic["expires_at"]),
-            "time_left_seconds": time_left_seconds(lic["expires_at"])
-        },
-        "activations": activations
+        "license": license_public_payload(lic),
+        "activations": activations,
+        "server_now_utc_ts": utc_now_ts()
     }
 
 
@@ -1161,6 +1236,10 @@ def admin_create_license(payload: AdminCreateLicenseRequest, x_admin_token: Opti
     if existing:
         return {"ok": False, "message": "License key already exists"}
 
+    normalized_expires_at = normalize_utc_db_str(payload.expires_at)
+    if payload.expires_at and normalized_expires_at is None:
+        return {"ok": False, "message": "Invalid expires_at format"}
+
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -1170,7 +1249,7 @@ def admin_create_license(payload: AdminCreateLicenseRequest, x_admin_token: Opti
         license_key,
         payload.name or "",
         "active",
-        payload.expires_at,
+        normalized_expires_at,
         max(1, int(payload.max_accounts)),
         payload.note or "",
         utc_now_str()
@@ -1183,9 +1262,11 @@ def admin_create_license(payload: AdminCreateLicenseRequest, x_admin_token: Opti
         "license_key": license_key,
         "name": payload.name or "",
         "status": "active",
-        "expires_at": payload.expires_at,
+        "expires_at": normalized_expires_at,
+        "expires_at_ts": dt_str_to_unix(normalized_expires_at),
         "max_accounts": max(1, int(payload.max_accounts)),
-        "note": payload.note or ""
+        "note": payload.note or "",
+        "server_now_utc_ts": utc_now_ts()
     }
 
 
@@ -1200,7 +1281,8 @@ def admin_update_license(license_key: str, payload: AdminUpdateLicenseRequest, x
     new_license_key = (payload.new_license_key if payload.new_license_key is not None else lic["license_key"]).strip().upper()
     name = payload.name if payload.name is not None else lic["name"]
     status = payload.status if payload.status is not None else lic["status"]
-    expires_at = payload.expires_at if payload.expires_at is not None else lic["expires_at"]
+    expires_at_raw = payload.expires_at if payload.expires_at is not None else lic["expires_at"]
+    expires_at = normalize_utc_db_str(expires_at_raw)
     max_accounts = payload.max_accounts if payload.max_accounts is not None else lic["max_accounts"]
     note = payload.note if payload.note is not None else lic["note"]
 
@@ -1209,6 +1291,9 @@ def admin_update_license(license_key: str, payload: AdminUpdateLicenseRequest, x
 
     if status not in ["active", "inactive"]:
         return {"ok": False, "message": "Invalid status"}
+
+    if expires_at_raw is not None and expires_at is None:
+        return {"ok": False, "message": "Invalid expires_at format"}
 
     max_accounts = max(1, int(max_accounts))
 
@@ -1234,8 +1319,10 @@ def admin_update_license(license_key: str, payload: AdminUpdateLicenseRequest, x
         "name": name or "",
         "status": status,
         "expires_at": expires_at,
+        "expires_at_ts": dt_str_to_unix(expires_at),
         "max_accounts": max_accounts,
-        "note": note or ""
+        "note": note or "",
+        "server_now_utc_ts": utc_now_ts()
     }
 
 
@@ -1267,7 +1354,9 @@ def admin_extend_license(license_key: str, payload: AdminExtendLicenseRequest, x
         "ok": True,
         "message": f"License extended by {days} days",
         "license_key": license_key,
-        "expires_at": new_expires_at
+        "expires_at": new_expires_at,
+        "expires_at_ts": dt_str_to_unix(new_expires_at),
+        "server_now_utc_ts": utc_now_ts()
     }
 
 
@@ -1286,7 +1375,7 @@ def admin_reset_activations(license_key: str, x_admin_token: Optional[str] = Hea
     conn.commit()
     conn.close()
 
-    return {"ok": True, "message": "Activations reset", "deleted": deleted}
+    return {"ok": True, "message": "Activations reset", "deleted": deleted, "server_now_utc_ts": utc_now_ts()}
 
 
 @app.delete("/admin/license/{license_key}")
@@ -1304,7 +1393,7 @@ def admin_delete_license(license_key: str, x_admin_token: Optional[str] = Header
     conn.commit()
     conn.close()
 
-    return {"ok": True, "message": "License deleted", "license_key": license_key}
+    return {"ok": True, "message": "License deleted", "license_key": license_key, "server_now_utc_ts": utc_now_ts()}
 
 
 @app.get("/admin/activations")
@@ -1338,7 +1427,7 @@ def admin_list_activations(x_admin_token: Optional[str] = Header(None)):
         item["client_status"] = online_status_from_last_seen(item["last_seen_at"])
         items.append(item)
 
-    return {"ok": True, "activations": items}
+    return {"ok": True, "activations": items, "server_now_utc_ts": utc_now_ts()}
 
 
 @app.get("/admin/online-clients")
@@ -1376,9 +1465,10 @@ def admin_online_clients(x_admin_token: Optional[str] = Header(None)):
         item["client_status"] = online_status_from_last_seen(item["last_seen_at"])
         item["time_left_text"] = format_time_left_human(item["expires_at"])
         item["time_left_seconds"] = time_left_seconds(item["expires_at"])
+        item["expires_at_ts"] = dt_str_to_unix(item["expires_at"])
         items.append(item)
 
-    return {"ok": True, "clients": items}
+    return {"ok": True, "clients": items, "server_now_utc_ts": utc_now_ts()}
 
 
 # =============================
@@ -1827,7 +1917,6 @@ async function startLogin() {
     });
 
     if (result.ok) {
-        // OTP изключен -> директен вход
         if (result.token) {
             setToken(result.token);
 
@@ -1842,7 +1931,6 @@ async function startLogin() {
             return;
         }
 
-        // OTP включен -> минаваш на стъпка 2
         loginChallengeId = result.challenge_id;
 
         document.getElementById("otpInfo").textContent =
@@ -1969,7 +2057,7 @@ async function loadDashboard() {
             <div class="metric"><div class="label">Total Balance</div><div class="value">${safeNum(result.total_balance)}</div></div>
             <div class="metric"><div class="label">Total Equity</div><div class="value">${safeNum(result.total_equity)}</div></div>
         </div>
-        <div class="small" style="margin-top:10px;">Server time: <b>${utcToLocalDisplay(result.server_time)}</b></div>
+        <div class="small" style="margin-top:10px;">Server time: <b>${utcToLocalDisplay(result.server_now_utc_ts || result.server_time)}</b></div>
     `;
 }
 
@@ -2048,7 +2136,7 @@ async function loadLicenses() {
             <td class="mono">${escapeHtml(lic.license_key)}</td>
             <td>${licenseStatusBadge(lic.effective_status)}</td>
             <td>${clientStatusBadge(lic.client_status)}</td>
-            <td class="nowrap">${escapeHtml(utcToLocalDisplay(lic.expires_at || ""))}</td>
+            <td class="nowrap">${escapeHtml(utcToLocalDisplay(lic.expires_at_ts || lic.expires_at || ""))}</td>
             <td class="nowrap">${escapeHtml(lic.time_left_text || "-")}</td>
             <td>${lic.max_accounts}</td>
             <td>${escapeHtml(lic.latest_account_login || "")}</td>
@@ -2139,7 +2227,7 @@ async function loadOnlineClients() {
           <td>${escapeHtml(row.broker_server || "")}</td>
           <td>${safeNum(row.balance)}</td>
           <td>${safeNum(row.equity)}</td>
-          <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.expires_at || ""))}</td>
+          <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.expires_at_ts || row.expires_at || ""))}</td>
           <td class="nowrap">${escapeHtml(row.time_left_text || "-")}</td>
           <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.last_seen_at || ""))}</td>
           <td>${escapeHtml(row.note || "")}</td>
