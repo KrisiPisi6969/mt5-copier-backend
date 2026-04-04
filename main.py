@@ -8,6 +8,7 @@ from psycopg.rows import dict_row
 import secrets
 import os
 import smtplib
+import time
 from email.mime.text import MIMEText
 
 
@@ -35,6 +36,9 @@ ADMIN_LOGIN_CHALLENGES = {}
 ADMIN_SESSION_TTL_MINUTES = 30
 ADMIN_OTP_TTL_MINUTES = 5
 ADMIN_OTP_MAX_ATTEMPTS = 3
+
+PULL_RATE_LIMIT = {}
+ACTIVATE_RATE_LIMIT = {}
 
 
 # =============================
@@ -429,6 +433,115 @@ def cleanup_expired_admin_sessions():
         del ADMIN_SESSIONS[token]
 
 
+def rate_limit_hit(store: dict, key: str, min_interval_seconds: float) -> bool:
+    now_ts = time.time()
+    last_ts = float(store.get(key, 0.0))
+    if now_ts - last_ts < min_interval_seconds:
+        return True
+    store[key] = now_ts
+    return False
+
+
+def make_client_key(license_key: str,
+                    account_login: str = "",
+                    broker_server: str = "",
+                    machine_id: str = "") -> str:
+    return "|".join([
+        str(license_key or "").strip(),
+        str(account_login or "").strip(),
+        str(broker_server or "").strip(),
+        str(machine_id or "").strip()
+    ])
+
+
+def update_activation_monitoring(license_key: str,
+                                 account_login: Optional[str] = None,
+                                 broker_server: Optional[str] = None,
+                                 machine_id: Optional[str] = None,
+                                 balance: Optional[float] = None,
+                                 equity: Optional[float] = None,
+                                 success: bool = True,
+                                 error_message: str = ""):
+    lic = get_license_by_key(license_key)
+    if not lic:
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    row = None
+    if account_login:
+        cur.execute("""
+        SELECT * FROM activations
+        WHERE license_id = %s AND account_login = %s
+        ORDER BY last_seen_at DESC
+        LIMIT 1
+        """, (lic["id"], account_login))
+        row = cur.fetchone()
+
+    if row:
+        if success:
+            cur.execute("""
+            UPDATE activations
+            SET last_seen_at = %s,
+                last_pull_at = %s,
+                broker_server = COALESCE(%s, broker_server),
+                machine_id = COALESCE(%s, machine_id),
+                balance = COALESCE(%s, balance),
+                equity = COALESCE(%s, equity),
+                last_error = '',
+                last_error_at = NULL,
+                pull_fail_count = 0
+            WHERE id = %s
+            """, (
+                utc_now_str(),
+                utc_now_str(),
+                broker_server,
+                machine_id,
+                balance,
+                equity,
+                row["id"]
+            ))
+        else:
+            cur.execute("""
+            UPDATE activations
+            SET last_error = %s,
+                last_error_at = %s,
+                pull_fail_count = COALESCE(pull_fail_count, 0) + 1,
+                broker_server = COALESCE(%s, broker_server),
+                machine_id = COALESCE(%s, machine_id)
+            WHERE id = %s
+            """, (
+                error_message,
+                utc_now_str(),
+                broker_server,
+                machine_id,
+                row["id"]
+            ))
+    else:
+        if success:
+            cur.execute("""
+            INSERT INTO activations (
+                license_id, account_login, broker_server, machine_id, balance, equity,
+                created_at, last_seen_at, last_pull_at, last_error, last_error_at, pull_fail_count
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, '', NULL, 0)
+            """, (
+                lic["id"],
+                account_login or "",
+                broker_server or "",
+                machine_id or "",
+                float(balance or 0.0),
+                float(equity or 0.0),
+                utc_now_str(),
+                utc_now_str(),
+                utc_now_str()
+            ))
+
+    conn.commit()
+    conn.close()
+
+
 def require_admin_token(x_admin_token: Optional[str]):
     cleanup_expired_admin_sessions()
 
@@ -530,6 +643,11 @@ def init_db():
             ensure_column(cur, "licenses", "locked_account_login", "TEXT")
             ensure_column(cur, "licenses", "locked_broker_server", "TEXT")
             ensure_column(cur, "licenses", "locked_at", "TEXT")
+
+            ensure_column(cur, "activations", "last_pull_at", "TEXT")
+            ensure_column(cur, "activations", "last_error", "TEXT")
+            ensure_column(cur, "activations", "last_error_at", "TEXT")
+            ensure_column(cur, "activations", "pull_fail_count", "INTEGER DEFAULT 0")
 
             cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_license_key ON licenses(license_key)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_activations_license_id ON activations(license_id)")
@@ -657,21 +775,29 @@ def refresh_last_seen_by_license(license_key: str,
             cur.execute("""
             UPDATE activations
             SET last_seen_at = %s,
+                last_pull_at = %s,
                 broker_server = COALESCE(%s, broker_server),
                 machine_id = COALESCE(%s, machine_id),
                 balance = COALESCE(%s, balance),
-                equity = COALESCE(%s, equity)
+                equity = COALESCE(%s, equity),
+                last_error = '',
+                last_error_at = NULL,
+                pull_fail_count = 0
             WHERE id = %s
-            """, (utc_now_str(), broker_server, machine_id, balance, equity, row["id"]))
+            """, (utc_now_str(), utc_now_str(), broker_server, machine_id, balance, equity, row["id"]))
             conn.commit()
             conn.close()
             return
 
     cur.execute("""
     UPDATE activations
-    SET last_seen_at = %s
+    SET last_seen_at = %s,
+        last_pull_at = %s,
+        last_error = '',
+        last_error_at = NULL,
+        pull_fail_count = 0
     WHERE license_id = %s
-    """, (utc_now_str(), lic["id"]))
+    """, (utc_now_str(), utc_now_str(), lic["id"]))
     conn.commit()
     conn.close()
 
@@ -914,6 +1040,30 @@ def debug_env():
 
 @app.post("/slave/activate")
 def slave_activate(payload: SlaveActivateRequest):
+    client_key = make_client_key(
+        payload.license_key,
+        payload.account_login,
+        payload.broker_server,
+        payload.machine_id
+    )
+
+    if rate_limit_hit(ACTIVATE_RATE_LIMIT, client_key, 3.0):
+        message = "Too many activation requests"
+        write_log(
+            event_type="slave_activate",
+            license_key=payload.license_key,
+            account_login=payload.account_login,
+            broker_server=payload.broker_server,
+            machine_id=payload.machine_id,
+            status="fail",
+            message=message
+        )
+        return {
+            "ok": False,
+            "message": message,
+            "server_now_utc_ts": utc_now_ts()
+        }
+
     ok, message, lic = validate_license_for_activation(
         payload.license_key,
         payload.account_login,
@@ -922,6 +1072,16 @@ def slave_activate(payload: SlaveActivateRequest):
     )
 
     if not ok:
+        update_activation_monitoring(
+            payload.license_key,
+            payload.account_login,
+            payload.broker_server,
+            payload.machine_id,
+            payload.account_balance,
+            payload.account_equity,
+            success=False,
+            error_message=message
+        )
         write_log(
             event_type="slave_activate",
             license_key=payload.license_key,
@@ -944,6 +1104,17 @@ def slave_activate(payload: SlaveActivateRequest):
         payload.machine_id,
         float(payload.account_balance or 0.0),
         float(payload.account_equity or 0.0)
+    )
+
+    update_activation_monitoring(
+        payload.license_key,
+        payload.account_login,
+        payload.broker_server,
+        payload.machine_id,
+        payload.account_balance,
+        payload.account_equity,
+        success=True,
+        error_message=""
     )
 
     expires_at_ts = dt_str_to_unix(lic["expires_at"])
@@ -973,7 +1144,6 @@ def slave_activate(payload: SlaveActivateRequest):
         "max_accounts": lic["max_accounts"]
     }
 
-
 @app.post("/master/publish")
 def master_publish(payload: MasterPublishRequest):
     if payload.master_token != VALID_MASTER_TOKEN:
@@ -999,6 +1169,50 @@ def master_publish(payload: MasterPublishRequest):
 
 @app.post("/slave/pull")
 def slave_pull(payload: SlavePullRequest):
+    client_key = make_client_key(
+        payload.license_key,
+        payload.account_login or "",
+        payload.broker_server or "",
+        payload.machine_id or ""
+    )
+
+    if rate_limit_hit(PULL_RATE_LIMIT, client_key, 0.5):
+        message = "Too many pull requests"
+        update_activation_monitoring(
+            payload.license_key,
+            payload.account_login,
+            payload.broker_server,
+            payload.machine_id,
+            payload.account_balance,
+            payload.account_equity,
+            success=False,
+            error_message=message
+        )
+        if should_write_log(
+            event_type="slave_pull",
+            license_key=payload.license_key,
+            account_login=payload.account_login or "",
+            broker_server=payload.broker_server or "",
+            machine_id=payload.machine_id or "",
+            status="fail",
+            message=message,
+            cooldown_seconds=60
+        ):
+            write_log(
+                event_type="slave_pull",
+                license_key=payload.license_key,
+                account_login=payload.account_login or "",
+                broker_server=payload.broker_server or "",
+                machine_id=payload.machine_id or "",
+                status="fail",
+                message=message
+            )
+        return {
+            "ok": False,
+            "message": message,
+            "server_now_utc_ts": utc_now_ts()
+        }
+
     ok, message, lic = validate_license_access_for_pull(
         payload.license_key,
         payload.account_login,
@@ -1007,6 +1221,16 @@ def slave_pull(payload: SlavePullRequest):
     )
 
     if not ok:
+        update_activation_monitoring(
+            payload.license_key,
+            payload.account_login,
+            payload.broker_server,
+            payload.machine_id,
+            payload.account_balance,
+            payload.account_equity,
+            success=False,
+            error_message=message
+        )
         if should_write_log(
             event_type="slave_pull",
             license_key=payload.license_key,
@@ -1694,7 +1918,11 @@ def admin_list_activations(x_admin_token: Optional[str] = Header(None)):
         a.balance,
         a.equity,
         a.created_at,
-        a.last_seen_at
+        a.last_seen_at,
+        a.last_pull_at,
+        a.last_error,
+        a.last_error_at,
+        COALESCE(a.pull_fail_count, 0) AS pull_fail_count
     FROM activations a
     JOIN licenses l ON l.id = a.license_id
     ORDER BY a.last_seen_at DESC
@@ -1709,7 +1937,6 @@ def admin_list_activations(x_admin_token: Optional[str] = Header(None)):
         items.append(item)
 
     return {"ok": True, "activations": items, "server_now_utc_ts": utc_now_ts()}
-
 
 @app.get("/admin/online-clients")
 def admin_online_clients(x_admin_token: Optional[str] = Header(None)):
@@ -1732,7 +1959,11 @@ def admin_online_clients(x_admin_token: Optional[str] = Header(None)):
         a.machine_id,
         a.balance,
         a.equity,
-        a.last_seen_at
+        a.last_seen_at,
+        a.last_pull_at,
+        a.last_error,
+        a.last_error_at,
+        COALESCE(a.pull_fail_count, 0) AS pull_fail_count
     FROM activations a
     JOIN licenses l ON l.id = a.license_id
     WHERE a.last_seen_at >= %s
@@ -1753,7 +1984,6 @@ def admin_online_clients(x_admin_token: Optional[str] = Header(None)):
         items.append(item)
 
     return {"ok": True, "clients": items, "server_now_utc_ts": utc_now_ts()}
-
 
 @app.get("/admin/logs")
 def admin_logs(limit: int = 15, offset: int = 0, x_admin_token: Optional[str] = Header(None)):
@@ -2566,6 +2796,9 @@ async function loadOnlineClients() {
         <th>Expires</th>
         <th>Time Left</th>
         <th>Last Seen</th>
+        <th>Last Pull</th>
+        <th>Pull Fails</th>
+        <th>Last Error</th>
         <th>Locked To</th>
         <th>Notes</th>
       </tr>
@@ -2584,6 +2817,9 @@ async function loadOnlineClients() {
           <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.expires_at_ts || row.expires_at || ""))}</td>
           <td class="nowrap">${escapeHtml(row.time_left_text || "-")}</td>
           <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.last_seen_at || ""))}</td>
+          <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.last_pull_at || ""))}</td>
+          <td>${escapeHtml(String(row.pull_fail_count ?? 0))}</td>
+          <td>${escapeHtml(row.last_error || "")}</td>
           <td>${escapeHtml((row.locked_account_login || "") + ((row.locked_broker_server || "") ? " @ " + row.locked_broker_server : ""))}</td>
           <td>${escapeHtml(row.note || "")}</td>
         </tr>
@@ -2615,6 +2851,10 @@ async function loadActivations() {
         <th>Equity</th>
         <th>Created</th>
         <th>Last Seen</th>
+        <th>Last Pull</th>
+        <th>Pull Fails</th>
+        <th>Last Error</th>
+        <th>Last Error At</th>
       </tr>
     `;
     for (const row of result.activations) {
@@ -2630,6 +2870,10 @@ async function loadActivations() {
             <td>${safeNum(row.equity)}</td>
             <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.created_at))}</td>
             <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.last_seen_at))}</td>
+            <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.last_pull_at || ""))}</td>
+            <td>${escapeHtml(String(row.pull_fail_count ?? 0))}</td>
+            <td>${escapeHtml(row.last_error || "")}</td>
+            <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.last_error_at || ""))}</td>
         </tr>
         `;
     }
