@@ -354,6 +354,124 @@ def clear_all_logs() -> int:
         return 0
 
 
+def cleanup_old_errors(days: int = 7) -> int:
+    try:
+        cutoff = (utc_now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM slave_errors WHERE created_at < %s", (cutoff,))
+        deleted = cur.rowcount
+        conn.commit()
+        conn.close()
+        return int(deleted or 0)
+    except Exception as e:
+        print("cleanup_old_errors failed:", str(e))
+        return 0
+
+
+def clear_all_errors() -> int:
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM slave_errors")
+        deleted = cur.rowcount
+        conn.commit()
+        conn.close()
+        return int(deleted or 0)
+    except Exception as e:
+        print("clear_all_errors failed:", str(e))
+        return 0
+
+
+def should_write_slave_error(license_key: str = "",
+                             account_login: str = "",
+                             broker_server: str = "",
+                             machine_id: str = "",
+                             category: str = "",
+                             severity: str = "",
+                             symbol: str = "",
+                             code: str = "",
+                             message: str = "",
+                             cooldown_seconds: int = 60) -> bool:
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        threshold = (utc_now() - timedelta(seconds=cooldown_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute("""
+        SELECT id
+        FROM slave_errors
+        WHERE license_key = %s
+          AND account_login = %s
+          AND broker_server = %s
+          AND machine_id = %s
+          AND category = %s
+          AND severity = %s
+          AND symbol = %s
+          AND code = %s
+          AND message = %s
+          AND created_at >= %s
+        ORDER BY id DESC
+        LIMIT 1
+        """, (
+            license_key,
+            account_login,
+            broker_server,
+            machine_id,
+            category,
+            severity,
+            symbol,
+            code,
+            message,
+            threshold
+        ))
+        row = cur.fetchone()
+        conn.close()
+        return row is None
+    except Exception as e:
+        print("should_write_slave_error failed:", str(e))
+        return True
+
+
+def write_slave_error(license_key: str = "",
+                      account_login: str = "",
+                      broker_server: str = "",
+                      machine_id: str = "",
+                      category: str = "",
+                      severity: str = "error",
+                      symbol: str = "",
+                      code: str = "",
+                      message: str = "",
+                      details: str = "",
+                      snapshot_id: str = ""):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO slave_errors (
+            created_at, license_key, account_login, broker_server, machine_id,
+            category, severity, symbol, code, message, details, snapshot_id
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            utc_now_str(),
+            license_key,
+            account_login,
+            broker_server,
+            machine_id,
+            category,
+            severity,
+            symbol,
+            code,
+            message,
+            details,
+            snapshot_id
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("write_slave_error failed:", str(e))
+
+
 def send_email_code(to_email: str, code: str) -> tuple[bool, str]:
     smtp_host = get_smtp_host()
     smtp_port = get_smtp_port()
@@ -556,6 +674,24 @@ def init_db():
             )
             """)
 
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS slave_errors (
+                id BIGSERIAL PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                license_key TEXT NOT NULL DEFAULT '',
+                account_login TEXT NOT NULL DEFAULT '',
+                broker_server TEXT NOT NULL DEFAULT '',
+                machine_id TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
+                severity TEXT NOT NULL DEFAULT 'error',
+                symbol TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                details TEXT NOT NULL DEFAULT '',
+                snapshot_id TEXT NOT NULL DEFAULT ''
+            )
+            """)
+
             ensure_column(cur, "licenses", "locked_account_login", "TEXT")
             ensure_column(cur, "licenses", "locked_broker_server", "TEXT")
             ensure_column(cur, "licenses", "locked_at", "TEXT")
@@ -565,6 +701,8 @@ def init_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_activations_last_seen_at ON activations(last_seen_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_license_logs_created_at ON license_logs(created_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_license_logs_license_key ON license_logs(license_key)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_slave_errors_created_at ON slave_errors(created_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_slave_errors_license_key ON slave_errors(license_key)")
 
         conn.commit()
 
@@ -884,6 +1022,20 @@ class SlavePullRequest(BaseModel):
     account_equity: Optional[float] = None
 
 
+class SlaveErrorReportRequest(BaseModel):
+    license_key: str
+    account_login: Optional[str] = None
+    broker_server: Optional[str] = None
+    machine_id: Optional[str] = None
+    category: str = "copy_error"
+    severity: str = "error"
+    symbol: Optional[str] = ""
+    code: Optional[str] = ""
+    message: str
+    details: Optional[str] = ""
+    snapshot_id: Optional[str] = ""
+
+
 class AdminCreateLicenseRequest(BaseModel):
     license_key: Optional[str] = None
     name: Optional[str] = ""
@@ -915,9 +1067,11 @@ def startup_event():
     init_db()
     seed_test_license()
     deleted = cleanup_old_logs(7)
+    deleted_errors = cleanup_old_errors(7)
     print("STARTUP ENV DEBUG:", smtp_config_debug())
     print("DATABASE_URL configured =", DATABASE_URL != "")
     print("Old logs cleaned:", deleted)
+    print("Old slave errors cleaned:", deleted_errors)
 
 
 # =============================
@@ -1099,6 +1253,55 @@ def slave_pull(payload: SlavePullRequest):
         "positions": LATEST_SNAPSHOT["positions"],
         "pending_orders": LATEST_SNAPSHOT["pending_orders"],
         **common
+    }
+
+
+@app.post("/slave/report-error")
+def slave_report_error(payload: SlaveErrorReportRequest):
+    ok, message, lic = validate_license_access_for_pull(
+        payload.license_key,
+        payload.account_login,
+        payload.broker_server,
+        payload.machine_id
+    )
+
+    if not ok:
+        return {
+            "ok": False,
+            "message": message,
+            "server_now_utc_ts": utc_now_ts()
+        }
+
+    if should_write_slave_error(
+        license_key=payload.license_key,
+        account_login=payload.account_login or "",
+        broker_server=payload.broker_server or "",
+        machine_id=payload.machine_id or "",
+        category=payload.category or "",
+        severity=payload.severity or "error",
+        symbol=payload.symbol or "",
+        code=payload.code or "",
+        message=payload.message or "",
+        cooldown_seconds=60
+    ):
+        write_slave_error(
+            license_key=payload.license_key,
+            account_login=payload.account_login or "",
+            broker_server=payload.broker_server or "",
+            machine_id=payload.machine_id or "",
+            category=payload.category or "",
+            severity=payload.severity or "error",
+            symbol=payload.symbol or "",
+            code=payload.code or "",
+            message=payload.message or "",
+            details=payload.details or "",
+            snapshot_id=payload.snapshot_id or ""
+        )
+
+    return {
+        "ok": True,
+        "message": "Error recorded",
+        "server_now_utc_ts": utc_now_ts()
     }
 
 
@@ -1827,6 +2030,65 @@ def admin_logs(limit: int = 15, offset: int = 0, x_admin_token: Optional[str] = 
         "server_now_utc_ts": utc_now_ts()
     }
 
+@app.get("/admin/errors")
+def admin_errors(limit: int = 15, offset: int = 0, x_admin_token: Optional[str] = Header(None)):
+    require_admin_token(x_admin_token)
+
+    limit = max(1, min(int(limit), 100))
+    offset = max(0, int(offset))
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) AS cnt FROM slave_errors")
+    total = int(cur.fetchone()["cnt"])
+
+    cur.execute("""
+    SELECT
+        id,
+        created_at,
+        license_key,
+        account_login,
+        broker_server,
+        machine_id,
+        category,
+        severity,
+        symbol,
+        code,
+        message,
+        details,
+        snapshot_id
+    FROM slave_errors
+    ORDER BY id DESC
+    LIMIT %s OFFSET %s
+    """, (limit, offset))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    return {
+        "ok": True,
+        "errors": rows,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "server_now_utc_ts": utc_now_ts()
+    }
+
+
+@app.post("/admin/clear-errors")
+def admin_clear_errors(x_admin_token: Optional[str] = Header(None)):
+    require_admin_token(x_admin_token)
+
+    deleted = clear_all_errors()
+
+    return {
+        "ok": True,
+        "message": "All errors cleared",
+        "deleted": deleted,
+        "server_now_utc_ts": utc_now_ts()
+    }
+
+
 @app.post("/admin/clear-logs")
 def admin_clear_logs(x_admin_token: Optional[str] = Header(None)):
     require_admin_token(x_admin_token)
@@ -2051,6 +2313,18 @@ def admin_panel():
         </div>
 
         <div class="card">
+            <div class="topbar">
+                <h3>Slave Errors</h3>
+                <div class="toolbar">
+                    <button class="red" onclick="clearErrors()">Clear ALL errors</button>
+                </div>
+            </div>
+            <div class="table-wrap">
+                <div id="errorsTable"></div>
+            </div>
+        </div>
+
+        <div class="card">
             <h3>Activations</h3>
             <div class="table-wrap">
                 <div id="activationsTable"></div>
@@ -2159,6 +2433,8 @@ let adminToken = "";
 let loginChallengeId = "";
 let logsOffset = 0;
 const logsLimit = 15;
+let errorsOffset = 0;
+const errorsLimit = 15;
 
 function getToken() {
     return adminToken || "";
@@ -2171,6 +2447,7 @@ function setToken(token) {
 function clearToken() {
     adminToken = "";
     logsOffset = 0;
+    errorsOffset = 0;
 }
 
 function showLoginMessage(text, type = "success") {
@@ -2686,6 +2963,95 @@ async function loadActivations() {
     document.getElementById("activationsTable").innerHTML = html;
 }
 
+async function clearErrors() {
+    if (!confirm("Delete ALL slave errors? This cannot be undone.")) return;
+
+    const result = await apiPost("/admin/clear-errors", {});
+    if (!result.ok) {
+        alert(result.message || "Failed to clear errors");
+        return;
+    }
+
+    alert((result.message || "All errors cleared") + " Deleted: " + String(result.deleted || 0));
+    errorsOffset = 0;
+    await loadErrors();
+}
+
+async function loadErrors() {
+    const result = await apiGet(`/admin/errors?limit=${errorsLimit}&offset=${errorsOffset}`);
+
+    if (!result.ok) {
+        if (result.detail) showLoginOnly();
+        document.getElementById("errorsTable").innerHTML = "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
+        return;
+    }
+
+    const total = Number(result.total || 0);
+    const offset = Number(result.offset || 0);
+    const limit = Number(result.limit || errorsLimit);
+
+    let html = `
+    <table>
+      <tr>
+        <th>Time</th>
+        <th>License</th>
+        <th>Account</th>
+        <th>Broker</th>
+        <th>Category</th>
+        <th>Severity</th>
+        <th>Symbol</th>
+        <th>Code</th>
+        <th>Message</th>
+        <th>Details</th>
+        <th>Snapshot</th>
+      </tr>
+    `;
+    for (const row of result.errors) {
+        html += `
+        <tr>
+            <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.created_at || ""))}</td>
+            <td class="mono">${escapeHtml(row.license_key || "")}</td>
+            <td>${escapeHtml(row.account_login || "")}</td>
+            <td>${escapeHtml(row.broker_server || "")}</td>
+            <td>${escapeHtml(row.category || "")}</td>
+            <td>${escapeHtml(row.severity || "")}</td>
+            <td>${escapeHtml(row.symbol || "")}</td>
+            <td>${escapeHtml(row.code || "")}</td>
+            <td>${escapeHtml(row.message || "")}</td>
+            <td>${escapeHtml(row.details || "")}</td>
+            <td>${escapeHtml(row.snapshot_id || "")}</td>
+        </tr>
+        `;
+    }
+    html += "</table>";
+
+    const currentPage = total === 0 ? 1 : Math.floor(offset / limit) + 1;
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    const prevDisabled = offset <= 0 ? "disabled" : "";
+    const nextDisabled = offset + limit >= total ? "disabled" : "";
+
+    html += `
+    <div class="toolbar" style="margin-top:12px;">
+        <button class="gray" onclick="prevErrorsPage()" ${prevDisabled}>Prev</button>
+        <button class="gray" onclick="nextErrorsPage()" ${nextDisabled}>Next</button>
+        <span class="small">Page ${currentPage} / ${totalPages} | Showing ${result.errors.length} of ${total}</span>
+    </div>
+    `;
+
+    document.getElementById("errorsTable").innerHTML = html;
+}
+
+function prevErrorsPage() {
+    errorsOffset = Math.max(0, errorsOffset - errorsLimit);
+    loadErrors();
+}
+
+function nextErrorsPage() {
+    errorsOffset += errorsLimit;
+    loadErrors();
+}
+
+
 async function clearLogs() {
     if (!confirm("Delete ALL logs? This cannot be undone.")) return;
 
@@ -2775,6 +3141,7 @@ async function loadAll() {
     await loadDashboard();
     await loadLicenses();
     await loadOnlineClients();
+    await loadErrors();
     await loadActivations();
     await loadLogs();
 }
