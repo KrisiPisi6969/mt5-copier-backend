@@ -3,7 +3,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
-import sqlite3
+import psycopg
+from psycopg.rows import dict_row
 import secrets
 import os
 import smtplib
@@ -17,7 +18,7 @@ app = FastAPI(
     openapi_url=None
 )
 
-DB_PATH = "licenses.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 LATEST_SNAPSHOT = {
     "snapshot_id": "",
@@ -385,78 +386,60 @@ def license_public_payload(lic) -> dict:
 # Database helpers
 # =============================
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def has_column(conn, table_name: str, column_name: str) -> bool:
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table_name})")
-    rows = cur.fetchall()
-    for row in rows:
-        if row["name"] == column_name:
-            return True
-    return False
+    if not DATABASE_URL:
+        raise RuntimeError("Missing DATABASE_URL environment variable")
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS licenses (
+                id BIGSERIAL PRIMARY KEY,
+                license_key TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                expires_at TEXT,
+                max_accounts INTEGER NOT NULL DEFAULT 1,
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS licenses (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        license_key TEXT UNIQUE NOT NULL,
-        name TEXT DEFAULT '',
-        status TEXT NOT NULL DEFAULT 'active',
-        expires_at TEXT,
-        max_accounts INTEGER NOT NULL DEFAULT 1,
-        note TEXT DEFAULT '',
-        created_at TEXT NOT NULL
-    )
-    """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS activations (
+                id BIGSERIAL PRIMARY KEY,
+                license_id BIGINT NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
+                account_login TEXT NOT NULL,
+                broker_server TEXT NOT NULL,
+                machine_id TEXT NOT NULL,
+                balance DOUBLE PRECISION NOT NULL DEFAULT 0,
+                equity DOUBLE PRECISION NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                UNIQUE(license_id, account_login, broker_server, machine_id)
+            )
+            """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS activations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        license_id INTEGER NOT NULL,
-        account_login TEXT NOT NULL,
-        broker_server TEXT NOT NULL,
-        machine_id TEXT NOT NULL,
-        balance REAL DEFAULT 0,
-        equity REAL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        last_seen_at TEXT NOT NULL,
-        UNIQUE(license_id, account_login, broker_server, machine_id),
-        FOREIGN KEY (license_id) REFERENCES licenses(id)
-    )
-    """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_license_key ON licenses(license_key)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_activations_license_id ON activations(license_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_activations_last_seen_at ON activations(last_seen_at)")
 
-    if not has_column(conn, "licenses", "name"):
-        cur.execute("ALTER TABLE licenses ADD COLUMN name TEXT DEFAULT ''")
-
-    if not has_column(conn, "activations", "balance"):
-        cur.execute("ALTER TABLE activations ADD COLUMN balance REAL DEFAULT 0")
-
-    if not has_column(conn, "activations", "equity"):
-        cur.execute("ALTER TABLE activations ADD COLUMN equity REAL DEFAULT 0")
-
-    conn.commit()
-    conn.close()
+        conn.commit()
 
 
 def seed_test_license():
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("SELECT id FROM licenses WHERE license_key = ?", ("TEST-001",))
+    cur.execute("SELECT id FROM licenses WHERE license_key = %s", ("TEST-001",))
     row = cur.fetchone()
 
     if row is None:
         cur.execute("""
         INSERT INTO licenses (license_key, name, status, expires_at, max_accounts, note, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (
             "TEST-001",
             "Default Test Client",
@@ -474,7 +457,7 @@ def seed_test_license():
 def get_license_by_key(license_key: str):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM licenses WHERE license_key = ?", (license_key,))
+    cur.execute("SELECT * FROM licenses WHERE license_key = %s", (license_key,))
     row = cur.fetchone()
     conn.close()
     return row
@@ -490,7 +473,7 @@ def get_activation_by_login(license_id: int, account_login: str):
     cur = conn.cursor()
     cur.execute("""
     SELECT * FROM activations
-    WHERE license_id = ? AND account_login = ?
+    WHERE license_id = %s AND account_login = %s
     """, (license_id, account_login))
     row = cur.fetchone()
     conn.close()
@@ -502,7 +485,7 @@ def get_activation_exact(license_id: int, account_login: str, broker_server: str
     cur = conn.cursor()
     cur.execute("""
     SELECT * FROM activations
-    WHERE license_id = ? AND account_login = ? AND broker_server = ? AND machine_id = ?
+    WHERE license_id = %s AND account_login = %s AND broker_server = %s AND machine_id = %s
     """, (license_id, account_login, broker_server, machine_id))
     row = cur.fetchone()
     conn.close()
@@ -518,21 +501,21 @@ def refresh_activation_seen(license_id: int, account_login: str, broker_server: 
     if exact:
         cur.execute("""
         UPDATE activations
-        SET last_seen_at = ?, balance = ?, equity = ?
-        WHERE id = ?
+        SET last_seen_at = %s, balance = %s, equity = %s
+        WHERE id = %s
         """, (utc_now_str(), balance, equity, exact["id"]))
     else:
         same_login = get_activation_by_login(license_id, account_login)
         if same_login:
             cur.execute("""
             UPDATE activations
-            SET broker_server = ?, machine_id = ?, last_seen_at = ?, balance = ?, equity = ?
-            WHERE id = ?
+            SET broker_server = %s, machine_id = %s, last_seen_at = %s, balance = %s, equity = %s
+            WHERE id = %s
             """, (broker_server, machine_id, utc_now_str(), balance, equity, same_login["id"]))
         else:
             cur.execute("""
             INSERT INTO activations (license_id, account_login, broker_server, machine_id, balance, equity, created_at, last_seen_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, (license_id, account_login, broker_server, machine_id, balance, equity, utc_now_str(), utc_now_str()))
 
     conn.commit()
@@ -555,19 +538,19 @@ def refresh_last_seen_by_license(license_key: str,
     if account_login:
         cur.execute("""
         SELECT * FROM activations
-        WHERE license_id = ? AND account_login = ?
+        WHERE license_id = %s AND account_login = %s
         """, (lic["id"], account_login))
         row = cur.fetchone()
 
         if row:
             cur.execute("""
             UPDATE activations
-            SET last_seen_at = ?,
-                broker_server = COALESCE(?, broker_server),
-                machine_id = COALESCE(?, machine_id),
-                balance = COALESCE(?, balance),
-                equity = COALESCE(?, equity)
-            WHERE id = ?
+            SET last_seen_at = %s,
+                broker_server = COALESCE(%s, broker_server),
+                machine_id = COALESCE(%s, machine_id),
+                balance = COALESCE(%s, balance),
+                equity = COALESCE(%s, equity)
+            WHERE id = %s
             """, (utc_now_str(), broker_server, machine_id, balance, equity, row["id"]))
             conn.commit()
             conn.close()
@@ -575,8 +558,8 @@ def refresh_last_seen_by_license(license_key: str,
 
     cur.execute("""
     UPDATE activations
-    SET last_seen_at = ?
-    WHERE license_id = ?
+    SET last_seen_at = %s
+    WHERE license_id = %s
     """, (utc_now_str(), lic["id"]))
     conn.commit()
     conn.close()
@@ -598,15 +581,15 @@ def validate_license_for_activation(license_key: str, account_login: str, broker
 
     cur.execute("""
     SELECT * FROM activations
-    WHERE license_id = ? AND account_login = ?
+    WHERE license_id = %s AND account_login = %s
     """, (lic["id"], account_login))
     same_login = cur.fetchone()
 
     if same_login:
         cur.execute("""
         UPDATE activations
-        SET last_seen_at = ?, broker_server = ?, machine_id = ?
-        WHERE id = ?
+        SET last_seen_at = %s, broker_server = %s, machine_id = %s
+        WHERE id = %s
         """, (utc_now_str(), broker_server, machine_id, same_login["id"]))
         conn.commit()
         conn.close()
@@ -615,7 +598,7 @@ def validate_license_for_activation(license_key: str, account_login: str, broker
     cur.execute("""
     SELECT COUNT(*) AS cnt
     FROM activations
-    WHERE license_id = ?
+    WHERE license_id = %s
     """, (lic["id"],))
     cnt = int(cur.fetchone()["cnt"])
 
@@ -625,7 +608,7 @@ def validate_license_for_activation(license_key: str, account_login: str, broker
 
     cur.execute("""
     INSERT INTO activations (license_id, account_login, broker_server, machine_id, balance, equity, created_at, last_seen_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
     """, (lic["id"], account_login, broker_server, machine_id, 0.0, 0.0, utc_now_str(), utc_now_str()))
     conn.commit()
     conn.close()
@@ -730,9 +713,12 @@ class AdminExtendLicenseRequest(BaseModel):
 # =============================
 @app.on_event("startup")
 def startup_event():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is missing. Set it in Render Environment.")
     init_db()
     seed_test_license()
     print("STARTUP ENV DEBUG:", smtp_config_debug())
+    print("DATABASE_URL configured =", DATABASE_URL != "")
 
 
 # =============================
@@ -753,7 +739,8 @@ def debug_env():
     return {
         "ok": True,
         "env": smtp_config_debug(),
-        "server_now_utc_ts": utc_now_ts()
+        "server_now_utc_ts": utc_now_ts(),
+        "has_database_url": DATABASE_URL != ""
     }
 
 
@@ -1028,8 +1015,8 @@ def admin_dashboard(x_admin_token: Optional[str] = Header(None)):
     cur.execute("""
     SELECT COUNT(*) AS cnt
     FROM activations
-    WHERE last_seen_at >= datetime('now', '-2 minutes')
-    """)
+    WHERE last_seen_at >= %s
+    """, (((utc_now() - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")),))
     online_clients = int(cur.fetchone()["cnt"])
 
     cur.execute("SELECT COALESCE(SUM(balance),0) AS total_balance FROM activations")
@@ -1071,10 +1058,10 @@ def admin_live_clients_text(x_admin_token: Optional[str] = Header(None)):
         a.last_seen_at
     FROM activations a
     JOIN licenses l ON l.id = a.license_id
-    WHERE a.last_seen_at >= datetime('now', '-2 minutes')
+    WHERE a.last_seen_at >= %s
     ORDER BY a.last_seen_at DESC
     LIMIT 5
-    """)
+    """, (((utc_now() - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")),))
     rows = cur.fetchall()
     conn.close()
 
@@ -1159,14 +1146,14 @@ def admin_list_licenses(q: str = "", x_admin_token: Optional[str] = Header(None)
     if q:
         cur.execute(base_query + """
         WHERE
-            l.license_key LIKE ?
-            OR l.name LIKE ?
-            OR l.note LIKE ?
+            l.license_key ILIKE %s
+            OR l.name ILIKE %s
+            OR l.note ILIKE %s
             OR EXISTS (
                 SELECT 1
                 FROM activations a2
                 WHERE a2.license_id = l.id
-                  AND a2.account_login LIKE ?
+                  AND a2.account_login ILIKE %s
             )
         ORDER BY l.id DESC
         """, (like_q, like_q, like_q, like_q))
@@ -1210,7 +1197,7 @@ def admin_get_license(license_key: str, x_admin_token: Optional[str] = Header(No
         created_at,
         last_seen_at
     FROM activations
-    WHERE license_id = ?
+    WHERE license_id = %s
     ORDER BY last_seen_at DESC
     """, (lic["id"],))
     activations = [dict(r) for r in cur.fetchall()]
@@ -1244,7 +1231,7 @@ def admin_create_license(payload: AdminCreateLicenseRequest, x_admin_token: Opti
     cur = conn.cursor()
     cur.execute("""
     INSERT INTO licenses (license_key, name, status, expires_at, max_accounts, note, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
     """, (
         license_key,
         payload.name or "",
@@ -1306,8 +1293,8 @@ def admin_update_license(license_key: str, payload: AdminUpdateLicenseRequest, x
     cur = conn.cursor()
     cur.execute("""
     UPDATE licenses
-    SET license_key = ?, name = ?, status = ?, expires_at = ?, max_accounts = ?, note = ?
-    WHERE id = ?
+    SET license_key = %s, name = %s, status = %s, expires_at = %s, max_accounts = %s, note = %s
+    WHERE id = %s
     """, (new_license_key, name or "", status, expires_at, max_accounts, note or "", lic["id"]))
     conn.commit()
     conn.close()
@@ -1344,8 +1331,8 @@ def admin_extend_license(license_key: str, payload: AdminExtendLicenseRequest, x
     cur = conn.cursor()
     cur.execute("""
     UPDATE licenses
-    SET expires_at = ?
-    WHERE id = ?
+    SET expires_at = %s
+    WHERE id = %s
     """, (new_expires_at, lic["id"]))
     conn.commit()
     conn.close()
@@ -1370,7 +1357,7 @@ def admin_reset_activations(license_key: str, x_admin_token: Optional[str] = Hea
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM activations WHERE license_id = ?", (lic["id"],))
+    cur.execute("DELETE FROM activations WHERE license_id = %s", (lic["id"],))
     deleted = cur.rowcount
     conn.commit()
     conn.close()
@@ -1388,8 +1375,8 @@ def admin_delete_license(license_key: str, x_admin_token: Optional[str] = Header
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM activations WHERE license_id = ?", (lic["id"],))
-    cur.execute("DELETE FROM licenses WHERE id = ?", (lic["id"],))
+    cur.execute("DELETE FROM activations WHERE license_id = %s", (lic["id"],))
+    cur.execute("DELETE FROM licenses WHERE id = %s", (lic["id"],))
     conn.commit()
     conn.close()
 
@@ -1451,9 +1438,9 @@ def admin_online_clients(x_admin_token: Optional[str] = Header(None)):
         a.last_seen_at
     FROM activations a
     JOIN licenses l ON l.id = a.license_id
-    WHERE a.last_seen_at >= datetime('now', '-10 minutes')
+    WHERE a.last_seen_at >= %s
     ORDER BY a.last_seen_at DESC
-    """)
+    """, (((utc_now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")),))
     rows = cur.fetchall()
     conn.close()
 
@@ -1834,7 +1821,7 @@ function utcToLocalDisplay(value) {
 async function apiGet(url) {
     const token = getToken();
     const res = await fetch(url, {
-        headers: token ? { "x-admin-token": token } : {}
+        headers: token %s { "x-admin-token": token } : {}
     });
     return await res.json();
 }
@@ -2014,7 +2001,7 @@ function normalizeForSort(v) {
 }
 
 function sortItems(items, field, dir) {
-    const mul = dir === "asc" ? 1 : -1;
+    const mul = dir === "asc" %s 1 : -1;
     return [...items].sort((a, b) => {
         let av = normalizeForSort(a[field]);
         let bv = normalizeForSort(b[field]);
@@ -2025,8 +2012,8 @@ function sortItems(items, field, dir) {
         }
 
         if (field === "latest_balance" || field === "latest_equity" || field === "time_left_seconds") {
-            av = (av === null || av === undefined) ? -999999999 : Number(av);
-            bv = (bv === null || bv === undefined) ? -999999999 : Number(bv);
+            av = (av === null || av === undefined) %s -999999999 : Number(av);
+            bv = (bv === null || bv === undefined) %s -999999999 : Number(bv);
         }
 
         if (field === "effective_status" || field === "client_status" || field === "name" || field === "license_key" || field === "latest_account_login") {
@@ -2166,7 +2153,7 @@ function setSort(field) {
     const sortDir = document.getElementById("sortDir");
 
     if (sortField.value === field) {
-        sortDir.value = sortDir.value === "asc" ? "desc" : "asc";
+        sortDir.value = sortDir.value === "asc" %s "desc" : "asc";
     } else {
         sortField.value = field;
         sortDir.value = "desc";
@@ -2407,7 +2394,7 @@ async function copyCurrentLicense() {
 }
 
 function escapeHtml(str) {
-    return String(str ?? "")
+    return String(str %s? "")
       .replaceAll("&", "&amp;")
       .replaceAll("<", "&lt;")
       .replaceAll(">", "&gt;")
@@ -2416,7 +2403,7 @@ function escapeHtml(str) {
 }
 
 function jsq(str) {
-    return String(str ?? "").replaceAll("'", "\\\\'");
+    return String(str %s? "").replaceAll("'", "\\\\'");
 }
 
 showLoginOnly();
