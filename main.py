@@ -2403,7 +2403,7 @@ function escapeHtml(str) {
 }
 
 function jsq(str) {
-    return String(str %s? "").replaceAll("'", "\\\\'");
+    return String(str ?? "").replaceAll("'", "\\\\'");
 }
 
 showLoginOnly();
