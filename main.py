@@ -1821,7 +1821,7 @@ function utcToLocalDisplay(value) {
 async function apiGet(url) {
     const token = getToken();
     const res = await fetch(url, {
-headers: token ? { "x-admin-token": token } : {}
+headers: token ? { "x-admin-token": token } : {}}
 const mul = dir === "asc" ? 1 : -1;
 av = (av === null || av === undefined) ? -999999999 : Number(av);
 bv = (bv === null || bv === undefined) ? -999999999 : Number(bv);
