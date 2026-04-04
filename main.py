@@ -698,6 +698,11 @@ def init_db():
             ensure_column(cur, "licenses", "locked_broker_server", "TEXT")
             ensure_column(cur, "licenses", "locked_at", "TEXT")
 
+            ensure_column(cur, "activations", "balance", "DOUBLE PRECISION NOT NULL DEFAULT 0")
+            ensure_column(cur, "activations", "equity", "DOUBLE PRECISION NOT NULL DEFAULT 0")
+            ensure_column(cur, "activations", "open_positions_count", "INTEGER NOT NULL DEFAULT 0")
+            ensure_column(cur, "activations", "floating_pnl", "DOUBLE PRECISION NOT NULL DEFAULT 0")
+            
             cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_license_key ON licenses(license_key)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_activations_license_id ON activations(license_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_activations_last_seen_at ON activations(last_seen_at)")
