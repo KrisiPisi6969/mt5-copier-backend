@@ -2003,7 +2003,7 @@ function normalizeForSort(v) {
 }
 
 function sortItems(items, field, dir) {
-    const mul = dir === "asc" %s 1 : -1;
+    const mul = dir === "asc" ? 1 : -1;
     return [...items].sort((a, b) => {
         let av = normalizeForSort(a[field]);
         let bv = normalizeForSort(b[field]);
