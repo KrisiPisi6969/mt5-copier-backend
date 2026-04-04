@@ -653,6 +653,8 @@ def init_db():
                 machine_id TEXT NOT NULL,
                 balance DOUBLE PRECISION NOT NULL DEFAULT 0,
                 equity DOUBLE PRECISION NOT NULL DEFAULT 0,
+                open_positions_count INTEGER NOT NULL DEFAULT 0,
+                floating_pnl DOUBLE PRECISION NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
                 UNIQUE(license_id, account_login, broker_server, machine_id)
@@ -771,7 +773,8 @@ def get_activation_exact(license_id: int, account_login: str, broker_server: str
 
 
 def refresh_activation_seen(license_id: int, account_login: str, broker_server: str, machine_id: str,
-                            balance: float = 0.0, equity: float = 0.0):
+                            balance: float = 0.0, equity: float = 0.0,
+                            open_positions_count: int = 0, floating_pnl: float = 0.0):
     conn = get_conn()
     cur = conn.cursor()
 
@@ -779,22 +782,30 @@ def refresh_activation_seen(license_id: int, account_login: str, broker_server: 
     if exact:
         cur.execute("""
         UPDATE activations
-        SET last_seen_at = %s, balance = %s, equity = %s
+        SET last_seen_at = %s, balance = %s, equity = %s, open_positions_count = %s, floating_pnl = %s
         WHERE id = %s
-        """, (utc_now_str(), balance, equity, exact["id"]))
+        """, (utc_now_str(), balance, equity, int(open_positions_count or 0), float(floating_pnl or 0.0), exact["id"]))
     else:
         same_login = get_activation_by_login(license_id, account_login)
         if same_login:
             cur.execute("""
             UPDATE activations
-            SET broker_server = %s, machine_id = %s, last_seen_at = %s, balance = %s, equity = %s
+            SET broker_server = %s, machine_id = %s, last_seen_at = %s, balance = %s, equity = %s,
+                open_positions_count = %s, floating_pnl = %s
             WHERE id = %s
-            """, (broker_server, machine_id, utc_now_str(), balance, equity, same_login["id"]))
+            """, (broker_server, machine_id, utc_now_str(), balance, equity, int(open_positions_count or 0), float(floating_pnl or 0.0), same_login["id"]))
         else:
             cur.execute("""
-            INSERT INTO activations (license_id, account_login, broker_server, machine_id, balance, equity, created_at, last_seen_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (license_id, account_login, broker_server, machine_id, balance, equity, utc_now_str(), utc_now_str()))
+            INSERT INTO activations (
+                license_id, account_login, broker_server, machine_id,
+                balance, equity, open_positions_count, floating_pnl, created_at, last_seen_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                license_id, account_login, broker_server, machine_id,
+                balance, equity, int(open_positions_count or 0), float(floating_pnl or 0.0),
+                utc_now_str(), utc_now_str()
+            ))
 
     conn.commit()
     conn.close()
@@ -805,7 +816,9 @@ def refresh_last_seen_by_license(license_key: str,
                                  broker_server: Optional[str] = None,
                                  machine_id: Optional[str] = None,
                                  balance: Optional[float] = None,
-                                 equity: Optional[float] = None):
+                                 equity: Optional[float] = None,
+                                 open_positions_count: Optional[int] = None,
+                                 floating_pnl: Optional[float] = None):
     lic = get_license_by_key(license_key)
     if not lic:
         return
@@ -827,9 +840,11 @@ def refresh_last_seen_by_license(license_key: str,
                 broker_server = COALESCE(%s, broker_server),
                 machine_id = COALESCE(%s, machine_id),
                 balance = COALESCE(%s, balance),
-                equity = COALESCE(%s, equity)
+                equity = COALESCE(%s, equity),
+                open_positions_count = COALESCE(%s, open_positions_count),
+                floating_pnl = COALESCE(%s, floating_pnl)
             WHERE id = %s
-            """, (utc_now_str(), broker_server, machine_id, balance, equity, row["id"]))
+            """, (utc_now_str(), broker_server, machine_id, balance, equity, open_positions_count, floating_pnl, row["id"]))
             conn.commit()
             conn.close()
             return
@@ -912,9 +927,12 @@ def validate_license_for_activation(license_key: str, account_login: str, broker
         return False, "Max accounts reached", None
 
     cur.execute("""
-    INSERT INTO activations (license_id, account_login, broker_server, machine_id, balance, equity, created_at, last_seen_at)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-    """, (lic["id"], account_login, broker_server, machine_id, 0.0, 0.0, utc_now_str(), utc_now_str()))
+    INSERT INTO activations (
+        license_id, account_login, broker_server, machine_id,
+        balance, equity, open_positions_count, floating_pnl, created_at, last_seen_at
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (lic["id"], account_login, broker_server, machine_id, 0.0, 0.0, 0, 0.0, utc_now_str(), utc_now_str()))
     conn.commit()
     conn.close()
 
@@ -1010,6 +1028,8 @@ class SlaveActivateRequest(BaseModel):
     machine_id: str
     account_balance: Optional[float] = 0.0
     account_equity: Optional[float] = 0.0
+    account_open_positions_count: Optional[int] = 0
+    account_floating_pnl: Optional[float] = 0.0
 
 
 class SlavePullRequest(BaseModel):
@@ -1020,6 +1040,8 @@ class SlavePullRequest(BaseModel):
     machine_id: Optional[str] = None
     account_balance: Optional[float] = None
     account_equity: Optional[float] = None
+    account_open_positions_count: Optional[int] = None
+    account_floating_pnl: Optional[float] = None
 
 
 class SlaveErrorReportRequest(BaseModel):
@@ -1128,7 +1150,9 @@ def slave_activate(payload: SlaveActivateRequest):
         payload.broker_server,
         payload.machine_id,
         float(payload.account_balance or 0.0),
-        float(payload.account_equity or 0.0)
+        float(payload.account_equity or 0.0),
+        int(payload.account_open_positions_count or 0),
+        float(payload.account_floating_pnl or 0.0)
     )
 
     expires_at_ts = dt_str_to_unix(lic["expires_at"])
@@ -1223,7 +1247,9 @@ def slave_pull(payload: SlavePullRequest):
         payload.broker_server,
         payload.machine_id,
         payload.account_balance,
-        payload.account_equity
+        payload.account_equity,
+        payload.account_open_positions_count,
+        payload.account_floating_pnl
     )
 
     expires_at_ts = dt_str_to_unix(lic["expires_at"])
@@ -1504,6 +1530,8 @@ def admin_live_clients_text(x_admin_token: Optional[str] = Header(None)):
         a.broker_server,
         a.balance,
         a.equity,
+        a.open_positions_count,
+        a.floating_pnl,
         a.last_seen_at
     FROM activations a
     JOIN licenses l ON l.id = a.license_id
@@ -1591,7 +1619,21 @@ def admin_list_licenses(q: str = "", x_admin_token: Optional[str] = Header(None)
             WHERE a.license_id = l.id
             ORDER BY a.last_seen_at DESC
             LIMIT 1
-        ) AS latest_equity
+        ) AS latest_equity,
+        (
+            SELECT a.open_positions_count
+            FROM activations a
+            WHERE a.license_id = l.id
+            ORDER BY a.last_seen_at DESC
+            LIMIT 1
+        ) AS latest_open_positions_count,
+        (
+            SELECT a.floating_pnl
+            FROM activations a
+            WHERE a.license_id = l.id
+            ORDER BY a.last_seen_at DESC
+            LIMIT 1
+        ) AS latest_floating_pnl
     FROM licenses l
     """
 
@@ -1646,6 +1688,8 @@ def admin_get_license(license_key: str, x_admin_token: Optional[str] = Header(No
         machine_id,
         balance,
         equity,
+        open_positions_count,
+        floating_pnl,
         created_at,
         last_seen_at
     FROM activations
@@ -1927,6 +1971,8 @@ def admin_list_activations(x_admin_token: Optional[str] = Header(None)):
         a.machine_id,
         a.balance,
         a.equity,
+        a.open_positions_count,
+        a.floating_pnl,
         a.created_at,
         a.last_seen_at
     FROM activations a
@@ -2800,6 +2846,8 @@ async function loadLicenses() {
         <th>Broker</th>
         <th class="sortable" onclick="setSort('latest_balance')">Balance</th>
         <th class="sortable" onclick="setSort('latest_equity')">Equity</th>
+        <th>Open Pos</th>
+        <th>Floating P/L</th>
         <th class="sortable" onclick="setSort('last_seen_at')">Last Seen</th>
         <th>Locked To</th>
         <th>Notes</th>
@@ -2821,6 +2869,8 @@ async function loadLicenses() {
             <td>${escapeHtml(lic.latest_broker_server || "")}</td>
             <td>${safeNum(lic.latest_balance)}</td>
             <td>${safeNum(lic.latest_equity)}</td>
+            <td>${escapeHtml(String(lic.latest_open_positions_count ?? 0))}</td>
+            <td>${safeNum(lic.latest_floating_pnl)}</td>
             <td class="nowrap">${escapeHtml(utcToLocalDisplay(lic.last_seen_at || ""))}</td>
             <td>${escapeHtml((lic.locked_account_login || "") + ((lic.locked_broker_server || "") ? " @ " + lic.locked_broker_server : ""))}</td>
             <td>${escapeHtml(lic.note || "")}</td>
@@ -2889,6 +2939,8 @@ async function loadOnlineClients() {
         <th>Broker</th>
         <th>Balance</th>
         <th>Equity</th>
+        <th>Open Pos</th>
+        <th>Floating P/L</th>
         <th>Expires</th>
         <th>Time Left</th>
         <th>Last Seen</th>
@@ -2939,6 +2991,8 @@ async function loadActivations() {
         <th>Machine</th>
         <th>Balance</th>
         <th>Equity</th>
+        <th>Open Pos</th>
+        <th>Floating P/L</th>
         <th>Created</th>
         <th>Last Seen</th>
       </tr>
@@ -2954,6 +3008,8 @@ async function loadActivations() {
             <td>${escapeHtml(row.machine_id)}</td>
             <td>${safeNum(row.balance)}</td>
             <td>${safeNum(row.equity)}</td>
+            <td>${escapeHtml(String(row.open_positions_count ?? 0))}</td>
+            <td>${safeNum(row.floating_pnl)}</td>
             <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.created_at))}</td>
             <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.last_seen_at))}</td>
         </tr>
@@ -3168,7 +3224,7 @@ async function openEditModal(licenseKey) {
     document.getElementById("editLockedAt").value = utcToLocalDisplay(lic.locked_at || "");
     document.getElementById("editResult").textContent = "";
 
-    let html = "<table><tr><th>Account</th><th>Broker</th><th>Machine</th><th>Balance</th><th>Equity</th><th>Created</th><th>Last Seen</th></tr>";
+    let html = "<table><tr><th>Account</th><th>Broker</th><th>Machine</th><th>Balance</th><th>Equity</th><th>Open Pos</th><th>Floating P/L</th><th>Created</th><th>Last Seen</th></tr>";
     for (const a of result.activations) {
         html += `
         <tr>
@@ -3177,6 +3233,8 @@ async function openEditModal(licenseKey) {
           <td>${escapeHtml(a.machine_id || "")}</td>
           <td>${safeNum(a.balance)}</td>
           <td>${safeNum(a.equity)}</td>
+          <td>${escapeHtml(String(a.open_positions_count ?? 0))}</td>
+          <td>${safeNum(a.floating_pnl)}</td>
           <td>${escapeHtml(utcToLocalDisplay(a.created_at || ""))}</td>
           <td>${escapeHtml(utcToLocalDisplay(a.last_seen_at || ""))}</td>
         </tr>`;
