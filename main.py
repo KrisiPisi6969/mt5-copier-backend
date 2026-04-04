@@ -379,6 +379,9 @@ def license_public_payload(lic) -> dict:
         "max_accounts": lic["max_accounts"],
         "note": lic["note"],
         "created_at": lic["created_at"],
+        "locked_account_login": lic.get("locked_account_login"),
+        "locked_broker_server": lic.get("locked_broker_server"),
+        "locked_at": lic.get("locked_at"),
     }
 
 
@@ -389,6 +392,16 @@ def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("Missing DATABASE_URL environment variable")
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+
+def ensure_column(cur, table_name: str, column_name: str, column_type: str):
+    cur.execute("""
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_name = %s AND column_name = %s
+    """, (table_name, column_name))
+    if not cur.fetchone():
+        cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
 
 def init_db():
@@ -421,6 +434,10 @@ def init_db():
                 UNIQUE(license_id, account_login, broker_server, machine_id)
             )
             """)
+
+            ensure_column(cur, "licenses", "locked_account_login", "TEXT")
+            ensure_column(cur, "licenses", "locked_broker_server", "TEXT")
+            ensure_column(cur, "licenses", "locked_at", "TEXT")
 
             cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_license_key ON licenses(license_key)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_activations_license_id ON activations(license_id)")
@@ -578,6 +595,33 @@ def validate_license_for_activation(license_key: str, account_login: str, broker
 
     conn = get_conn()
     cur = conn.cursor()
+
+    locked_account_login = (lic.get("locked_account_login") or "").strip()
+    locked_broker_server = (lic.get("locked_broker_server") or "").strip()
+
+    # First successful activation locks the license to this MT5 account + broker
+    if locked_account_login == "":
+        cur.execute("""
+        UPDATE licenses
+        SET locked_account_login = %s,
+            locked_broker_server = %s,
+            locked_at = %s
+        WHERE id = %s
+        """, (account_login, broker_server, utc_now_str(), lic["id"]))
+        conn.commit()
+
+        cur.execute("SELECT * FROM licenses WHERE id = %s", (lic["id"],))
+        lic = cur.fetchone()
+        locked_account_login = (lic.get("locked_account_login") or "").strip()
+        locked_broker_server = (lic.get("locked_broker_server") or "").strip()
+    else:
+        if str(locked_account_login) != str(account_login):
+            conn.close()
+            return False, "License locked to another account", None
+
+        if locked_broker_server != "" and str(locked_broker_server) != str(broker_server):
+            conn.close()
+            return False, "License locked to another broker", None
 
     cur.execute("""
     SELECT * FROM activations
@@ -1102,6 +1146,9 @@ def admin_list_licenses(q: str = "", x_admin_token: Optional[str] = Header(None)
         l.max_accounts,
         l.note,
         l.created_at,
+        l.locked_account_login,
+        l.locked_broker_server,
+        l.locked_at,
         (
             SELECT COUNT(*)
             FROM activations a
@@ -1347,6 +1394,34 @@ def admin_extend_license(license_key: str, payload: AdminExtendLicenseRequest, x
     }
 
 
+@app.post("/admin/license/{license_key}/reset-lock")
+def admin_reset_lock(license_key: str, x_admin_token: Optional[str] = Header(None)):
+    require_admin_token(x_admin_token)
+
+    lic = get_license_by_key(license_key)
+    if not lic:
+        return {"ok": False, "message": "License not found"}
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE licenses
+    SET locked_account_login = NULL,
+        locked_broker_server = NULL,
+        locked_at = NULL
+    WHERE id = %s
+    """, (lic["id"],))
+    conn.commit()
+    conn.close()
+
+    return {
+        "ok": True,
+        "message": "License lock reset",
+        "license_key": license_key,
+        "server_now_utc_ts": utc_now_ts()
+    }
+
+
 @app.post("/admin/license/{license_key}/reset-activations")
 def admin_reset_activations(license_key: str, x_admin_token: Optional[str] = Header(None)):
     require_admin_token(x_admin_token)
@@ -1430,6 +1505,9 @@ def admin_online_clients(x_admin_token: Optional[str] = Header(None)):
         l.note,
         l.status,
         l.expires_at,
+        l.locked_account_login,
+        l.locked_broker_server,
+        l.locked_at,
         a.account_login,
         a.broker_server,
         a.machine_id,
@@ -1719,6 +1797,21 @@ def admin_panel():
                 </div>
             </div>
 
+            <div class="row">
+                <div>
+                    <label>Locked Account</label>
+                    <input id="editLockedAccount" disabled>
+                </div>
+                <div>
+                    <label>Locked Broker</label>
+                    <input id="editLockedBroker" disabled>
+                </div>
+                <div>
+                    <label>Locked At</label>
+                    <input id="editLockedAt" disabled>
+                </div>
+            </div>
+
             <div>
                 <label>Note</label>
                 <textarea id="editNote"></textarea>
@@ -1731,6 +1824,7 @@ def admin_panel():
                 <button onclick="extendCurrentLicense(30)">+30 days</button>
                 <button onclick="extendCurrentLicense(90)">+90 days</button>
                 <button class="orange" onclick="resetActivationsCurrent()">Reset Activations</button>
+                <button class="gray" onclick="resetCurrentLock()">Reset Lock</button>
                 <button class="red" onclick="deleteCurrentLicense()">Delete License</button>
             </div>
 
@@ -2111,6 +2205,7 @@ async function loadLicenses() {
         <th class="sortable" onclick="setSort('latest_balance')">Balance</th>
         <th class="sortable" onclick="setSort('latest_equity')">Equity</th>
         <th class="sortable" onclick="setSort('last_seen_at')">Last Seen</th>
+        <th>Locked To</th>
         <th>Notes</th>
         <th>Actions</th>
       </tr>
@@ -2131,6 +2226,7 @@ async function loadLicenses() {
             <td>${safeNum(lic.latest_balance)}</td>
             <td>${safeNum(lic.latest_equity)}</td>
             <td class="nowrap">${escapeHtml(utcToLocalDisplay(lic.last_seen_at || ""))}</td>
+            <td>${escapeHtml((lic.locked_account_login || "") + ((lic.locked_broker_server || "") ? " @ " + lic.locked_broker_server : ""))}</td>
             <td>${escapeHtml(lic.note || "")}</td>
             <td class="actions">
                 <button onclick="openEditModal('${jsq(lic.license_key)}')">Edit</button>
@@ -2200,6 +2296,7 @@ async function loadOnlineClients() {
         <th>Expires</th>
         <th>Time Left</th>
         <th>Last Seen</th>
+        <th>Locked To</th>
         <th>Notes</th>
       </tr>
     `;
@@ -2217,6 +2314,7 @@ async function loadOnlineClients() {
           <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.expires_at_ts || row.expires_at || ""))}</td>
           <td class="nowrap">${escapeHtml(row.time_left_text || "-")}</td>
           <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.last_seen_at || ""))}</td>
+          <td>${escapeHtml((row.locked_account_login || "") + ((row.locked_broker_server || "") ? " @ " + row.locked_broker_server : ""))}</td>
           <td>${escapeHtml(row.note || "")}</td>
         </tr>
         `;
@@ -2293,6 +2391,9 @@ async function openEditModal(licenseKey) {
     document.getElementById("editMaxAccounts").value = lic.max_accounts || 1;
     document.getElementById("editNote").value = lic.note || "";
     document.getElementById("editTimeLeft").value = lic.time_left_text || "-";
+    document.getElementById("editLockedAccount").value = lic.locked_account_login || "";
+    document.getElementById("editLockedBroker").value = lic.locked_broker_server || "";
+    document.getElementById("editLockedAt").value = utcToLocalDisplay(lic.locked_at || "");
     document.getElementById("editResult").textContent = "";
 
     let html = "<table><tr><th>Account</th><th>Broker</th><th>Machine</th><th>Balance</th><th>Equity</th><th>Created</th><th>Last Seen</th></tr>";
@@ -2353,6 +2454,19 @@ async function extendCurrentLicense(days) {
         await openEditModal(key);
     }
 }
+
+async function resetCurrentLock() {
+    const key = currentEditKey();
+    if (!confirm("Reset lock for this license?")) return;
+
+    const result = await apiPost(`/admin/license/${encodeURIComponent(key)}/reset-lock`, {});
+    document.getElementById("editResult").textContent = JSON.stringify(result, null, 2);
+    if (result.ok) {
+        await loadAll();
+        await openEditModal(key);
+    }
+}
+
 
 async function resetActivationsCurrent() {
     const key = currentEditKey();
