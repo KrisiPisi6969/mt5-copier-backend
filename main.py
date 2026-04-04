@@ -12,7 +12,7 @@ from email.mime.text import MIMEText
 
 
 app = FastAPI(
-    title="MT5 Copier API + Admin Panel",
+    title="MT5 Copier API + Admin Panel + Logs",
     docs_url=None,
     redoc_url=None,
     openapi_url=None
@@ -248,6 +248,40 @@ def smtp_config_debug() -> dict:
     }
 
 
+def write_log(event_type: str,
+              license_key: str = "",
+              account_login: str = "",
+              broker_server: str = "",
+              machine_id: str = "",
+              status: str = "",
+              message: str = "",
+              actor: str = ""):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO license_logs (
+            created_at, event_type, license_key, account_login, broker_server,
+            machine_id, status, message, actor
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            utc_now_str(),
+            event_type,
+            license_key,
+            account_login,
+            broker_server,
+            machine_id,
+            status,
+            message,
+            actor
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("write_log failed:", str(e))
+
+
 def send_email_code(to_email: str, code: str) -> tuple[bool, str]:
     smtp_host = get_smtp_host()
     smtp_port = get_smtp_port()
@@ -435,6 +469,21 @@ def init_db():
             )
             """)
 
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS license_logs (
+                id BIGSERIAL PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                license_key TEXT NOT NULL DEFAULT '',
+                account_login TEXT NOT NULL DEFAULT '',
+                broker_server TEXT NOT NULL DEFAULT '',
+                machine_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                actor TEXT NOT NULL DEFAULT ''
+            )
+            """)
+
             ensure_column(cur, "licenses", "locked_account_login", "TEXT")
             ensure_column(cur, "licenses", "locked_broker_server", "TEXT")
             ensure_column(cur, "licenses", "locked_at", "TEXT")
@@ -442,6 +491,8 @@ def init_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_license_key ON licenses(license_key)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_activations_license_id ON activations(license_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_activations_last_seen_at ON activations(last_seen_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_license_logs_created_at ON license_logs(created_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_license_logs_license_key ON license_logs(license_key)")
 
         conn.commit()
 
@@ -660,6 +711,36 @@ def validate_license_for_activation(license_key: str, account_login: str, broker
     return True, "License is valid", lic
 
 
+
+def validate_license_access_for_pull(license_key: str,
+                                     account_login: Optional[str],
+                                     broker_server: Optional[str],
+                                     machine_id: Optional[str]):
+    lic = get_license_by_key(license_key)
+    if not lic:
+        return False, "License not found", None
+
+    if lic["status"] != "active":
+        return False, "License inactive", None
+
+    if is_license_expired(lic["expires_at"]):
+        return False, "License expired", None
+
+    locked_account_login = (lic.get("locked_account_login") or "").strip()
+    locked_broker_server = (lic.get("locked_broker_server") or "").strip()
+
+    req_login = (account_login or "").strip()
+    req_broker = (broker_server or "").strip()
+
+    if locked_account_login != "" and req_login != "" and locked_account_login != req_login:
+        return False, "License locked to another account", None
+
+    if locked_broker_server != "" and req_broker != "" and locked_broker_server != req_broker:
+        return False, "License locked to another broker", None
+
+    return True, "License is valid", lic
+
+
 def validate_license_simple(license_key: str):
     lic = get_license_by_key(license_key)
     if not lic:
@@ -798,6 +879,15 @@ def slave_activate(payload: SlaveActivateRequest):
     )
 
     if not ok:
+        write_log(
+            event_type="slave_activate",
+            license_key=payload.license_key,
+            account_login=payload.account_login,
+            broker_server=payload.broker_server,
+            machine_id=payload.machine_id,
+            status="fail",
+            message=message
+        )
         return {
             "ok": False,
             "message": message,
@@ -815,6 +905,16 @@ def slave_activate(payload: SlaveActivateRequest):
 
     expires_at_ts = dt_str_to_unix(lic["expires_at"])
 
+    write_log(
+        event_type="slave_activate",
+        license_key=payload.license_key,
+        account_login=payload.account_login,
+        broker_server=payload.broker_server,
+        machine_id=payload.machine_id,
+        status="ok",
+        message=message
+    )
+
     return {
         "ok": True,
         "message": message,
@@ -822,6 +922,8 @@ def slave_activate(payload: SlaveActivateRequest):
         "poll_seconds": 1,
         "expires_at": lic["expires_at"],
         "expires_at_ts": expires_at_ts,
+        "locked_account_login": lic.get("locked_account_login"),
+        "locked_broker_server": lic.get("locked_broker_server"),
         "server_time": utc_now_ts(),
         "server_now_utc_ts": utc_now_ts(),
         "time_left_seconds": time_left_seconds(lic["expires_at"]),
@@ -854,9 +956,23 @@ def master_publish(payload: MasterPublishRequest):
 
 @app.post("/slave/pull")
 def slave_pull(payload: SlavePullRequest):
-    ok, message, lic = validate_license_simple(payload.license_key)
+    ok, message, lic = validate_license_access_for_pull(
+        payload.license_key,
+        payload.account_login,
+        payload.broker_server,
+        payload.machine_id
+    )
 
     if not ok:
+        write_log(
+            event_type="slave_pull",
+            license_key=payload.license_key,
+            account_login=payload.account_login or "",
+            broker_server=payload.broker_server or "",
+            machine_id=payload.machine_id or "",
+            status="fail",
+            message=message
+        )
         return {
             "ok": False,
             "message": message,
@@ -876,6 +992,8 @@ def slave_pull(payload: SlavePullRequest):
     common = {
         "expires_at": lic["expires_at"],
         "expires_at_ts": expires_at_ts,
+        "locked_account_login": lic.get("locked_account_login"),
+        "locked_broker_server": lic.get("locked_broker_server"),
         "server_now_utc_ts": utc_now_ts(),
         "time_left_seconds": time_left_seconds(lic["expires_at"])
     }
@@ -1291,6 +1409,14 @@ def admin_create_license(payload: AdminCreateLicenseRequest, x_admin_token: Opti
     conn.commit()
     conn.close()
 
+    write_log(
+        event_type="admin_create_license",
+        license_key=license_key,
+        status="ok",
+        message="License created",
+        actor="admin"
+    )
+
     return {
         "ok": True,
         "license_key": license_key,
@@ -1346,6 +1472,14 @@ def admin_update_license(license_key: str, payload: AdminUpdateLicenseRequest, x
     conn.commit()
     conn.close()
 
+    write_log(
+        event_type="admin_update_license",
+        license_key=new_license_key,
+        status="ok",
+        message="License updated",
+        actor="admin"
+    )
+
     return {
         "ok": True,
         "message": "License updated",
@@ -1384,6 +1518,14 @@ def admin_extend_license(license_key: str, payload: AdminExtendLicenseRequest, x
     conn.commit()
     conn.close()
 
+    write_log(
+        event_type="admin_extend_license",
+        license_key=license_key,
+        status="ok",
+        message=f"Extended by {days} days",
+        actor="admin"
+    )
+
     return {
         "ok": True,
         "message": f"License extended by {days} days",
@@ -1414,6 +1556,14 @@ def admin_reset_lock(license_key: str, x_admin_token: Optional[str] = Header(Non
     conn.commit()
     conn.close()
 
+    write_log(
+        event_type="admin_reset_lock",
+        license_key=license_key,
+        status="ok",
+        message="License lock reset",
+        actor="admin"
+    )
+
     return {
         "ok": True,
         "message": "License lock reset",
@@ -1437,6 +1587,14 @@ def admin_reset_activations(license_key: str, x_admin_token: Optional[str] = Hea
     conn.commit()
     conn.close()
 
+    write_log(
+        event_type="admin_reset_activations",
+        license_key=license_key,
+        status="ok",
+        message=f"Activations reset: {deleted}",
+        actor="admin"
+    )
+
     return {"ok": True, "message": "Activations reset", "deleted": deleted, "server_now_utc_ts": utc_now_ts()}
 
 
@@ -1454,6 +1612,14 @@ def admin_delete_license(license_key: str, x_admin_token: Optional[str] = Header
     cur.execute("DELETE FROM licenses WHERE id = %s", (lic["id"],))
     conn.commit()
     conn.close()
+
+    write_log(
+        event_type="admin_delete_license",
+        license_key=license_key,
+        status="ok",
+        message="License deleted",
+        actor="admin"
+    )
 
     return {"ok": True, "message": "License deleted", "license_key": license_key, "server_now_utc_ts": utc_now_ts()}
 
@@ -1534,6 +1700,36 @@ def admin_online_clients(x_admin_token: Optional[str] = Header(None)):
         items.append(item)
 
     return {"ok": True, "clients": items, "server_now_utc_ts": utc_now_ts()}
+
+
+@app.get("/admin/logs")
+def admin_logs(limit: int = 200, x_admin_token: Optional[str] = Header(None)):
+    require_admin_token(x_admin_token)
+
+    limit = max(1, min(int(limit), 1000))
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT
+        id,
+        created_at,
+        event_type,
+        license_key,
+        account_login,
+        broker_server,
+        machine_id,
+        status,
+        message,
+        actor
+    FROM license_logs
+    ORDER BY id DESC
+    LIMIT %s
+    """, (limit,))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    return {"ok": True, "logs": rows, "server_now_utc_ts": utc_now_ts()}
 
 
 # =============================
@@ -1750,6 +1946,13 @@ def admin_panel():
             <h3>Activations</h3>
             <div class="table-wrap">
                 <div id="activationsTable"></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Logs</h3>
+            <div class="table-wrap">
+                <div id="logsTable"></div>
             </div>
         </div>
     </div>
@@ -2367,11 +2570,55 @@ async function loadActivations() {
     document.getElementById("activationsTable").innerHTML = html;
 }
 
+async function loadLogs() {
+    const result = await apiGet("/admin/logs?limit=200");
+
+    if (!result.ok) {
+        if (result.detail) showLoginOnly();
+        document.getElementById("logsTable").innerHTML = "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
+        return;
+    }
+
+    let html = `
+    <table>
+      <tr>
+        <th>Time</th>
+        <th>Event</th>
+        <th>License</th>
+        <th>Account</th>
+        <th>Broker</th>
+        <th>Machine</th>
+        <th>Status</th>
+        <th>Message</th>
+        <th>Actor</th>
+      </tr>
+    `;
+    for (const row of result.logs) {
+        html += `
+        <tr>
+            <td class="nowrap">${escapeHtml(utcToLocalDisplay(row.created_at || ""))}</td>
+            <td>${escapeHtml(row.event_type || "")}</td>
+            <td class="mono">${escapeHtml(row.license_key || "")}</td>
+            <td>${escapeHtml(row.account_login || "")}</td>
+            <td>${escapeHtml(row.broker_server || "")}</td>
+            <td>${escapeHtml(row.machine_id || "")}</td>
+            <td>${escapeHtml(row.status || "")}</td>
+            <td>${escapeHtml(row.message || "")}</td>
+            <td>${escapeHtml(row.actor || "")}</td>
+        </tr>
+        `;
+    }
+    html += "</table>";
+    document.getElementById("logsTable").innerHTML = html;
+}
+
+
 async function loadAll() {
     await loadDashboard();
     await loadLicenses();
     await loadOnlineClients();
     await loadActivations();
+    await loadLogs();
 }
 
 async function openEditModal(licenseKey) {
