@@ -282,6 +282,49 @@ def write_log(event_type: str,
         print("write_log failed:", str(e))
 
 
+def should_write_log(event_type: str,
+                     license_key: str = "",
+                     account_login: str = "",
+                     broker_server: str = "",
+                     machine_id: str = "",
+                     status: str = "",
+                     message: str = "",
+                     cooldown_seconds: int = 60) -> bool:
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        threshold = (utc_now() - timedelta(seconds=cooldown_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute("""
+        SELECT id
+        FROM license_logs
+        WHERE event_type = %s
+          AND license_key = %s
+          AND account_login = %s
+          AND broker_server = %s
+          AND machine_id = %s
+          AND status = %s
+          AND message = %s
+          AND created_at >= %s
+        ORDER BY id DESC
+        LIMIT 1
+        """, (
+            event_type,
+            license_key,
+            account_login,
+            broker_server,
+            machine_id,
+            status,
+            message,
+            threshold
+        ))
+        row = cur.fetchone()
+        conn.close()
+        return row is None
+    except Exception as e:
+        print("should_write_log failed:", str(e))
+        return True
+
+
 def send_email_code(to_email: str, code: str) -> tuple[bool, str]:
     smtp_host = get_smtp_host()
     smtp_port = get_smtp_port()
@@ -964,15 +1007,25 @@ def slave_pull(payload: SlavePullRequest):
     )
 
     if not ok:
-        write_log(
+        if should_write_log(
             event_type="slave_pull",
             license_key=payload.license_key,
             account_login=payload.account_login or "",
             broker_server=payload.broker_server or "",
             machine_id=payload.machine_id or "",
             status="fail",
-            message=message
-        )
+            message=message,
+            cooldown_seconds=60
+        ):
+            write_log(
+                event_type="slave_pull",
+                license_key=payload.license_key,
+                account_login=payload.account_login or "",
+                broker_server=payload.broker_server or "",
+                machine_id=payload.machine_id or "",
+                status="fail",
+                message=message
+            )
         return {
             "ok": False,
             "message": message,
@@ -1703,13 +1756,18 @@ def admin_online_clients(x_admin_token: Optional[str] = Header(None)):
 
 
 @app.get("/admin/logs")
-def admin_logs(limit: int = 200, x_admin_token: Optional[str] = Header(None)):
+def admin_logs(limit: int = 15, offset: int = 0, x_admin_token: Optional[str] = Header(None)):
     require_admin_token(x_admin_token)
 
-    limit = max(1, min(int(limit), 1000))
+    limit = max(1, min(int(limit), 100))
+    offset = max(0, int(offset))
 
     conn = get_conn()
     cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) AS cnt FROM license_logs")
+    total = int(cur.fetchone()["cnt"])
+
     cur.execute("""
     SELECT
         id,
@@ -1724,13 +1782,19 @@ def admin_logs(limit: int = 200, x_admin_token: Optional[str] = Header(None)):
         actor
     FROM license_logs
     ORDER BY id DESC
-    LIMIT %s
-    """, (limit,))
+    LIMIT %s OFFSET %s
+    """, (limit, offset))
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
 
-    return {"ok": True, "logs": rows, "server_now_utc_ts": utc_now_ts()}
-
+    return {
+        "ok": True,
+        "logs": rows,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "server_now_utc_ts": utc_now_ts()
+    }
 
 # =============================
 # Admin HTML
@@ -2044,6 +2108,8 @@ def admin_panel():
 let autoRefreshHandle = null;
 let adminToken = "";
 let loginChallengeId = "";
+let logsOffset = 0;
+const logsLimit = 15;
 
 function getToken() {
     return adminToken || "";
@@ -2055,6 +2121,7 @@ function setToken(token) {
 
 function clearToken() {
     adminToken = "";
+    logsOffset = 0;
 }
 
 function showLoginMessage(text, type = "success") {
@@ -2571,13 +2638,17 @@ async function loadActivations() {
 }
 
 async function loadLogs() {
-    const result = await apiGet("/admin/logs?limit=200");
+    const result = await apiGet(`/admin/logs?limit=${logsLimit}&offset=${logsOffset}`);
 
     if (!result.ok) {
         if (result.detail) showLoginOnly();
         document.getElementById("logsTable").innerHTML = "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
         return;
     }
+
+    const total = Number(result.total || 0);
+    const offset = Number(result.offset || 0);
+    const limit = Number(result.limit || logsLimit);
 
     let html = `
     <table>
@@ -2609,9 +2680,32 @@ async function loadLogs() {
         `;
     }
     html += "</table>";
+
+    const currentPage = total === 0 ? 1 : Math.floor(offset / limit) + 1;
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    const prevDisabled = offset <= 0 ? "disabled" : "";
+    const nextDisabled = offset + limit >= total ? "disabled" : "";
+
+    html += `
+    <div class="toolbar" style="margin-top:12px;">
+        <button class="gray" onclick="prevLogsPage()" ${prevDisabled}>Prev</button>
+        <button class="gray" onclick="nextLogsPage()" ${nextDisabled}>Next</button>
+        <span class="small">Page ${currentPage} / ${totalPages} | Showing ${result.logs.length} of ${total}</span>
+    </div>
+    `;
+
     document.getElementById("logsTable").innerHTML = html;
 }
 
+function prevLogsPage() {
+    logsOffset = Math.max(0, logsOffset - logsLimit);
+    loadLogs();
+}
+
+function nextLogsPage() {
+    logsOffset += logsLimit;
+    loadLogs();
+}
 
 async function loadAll() {
     await loadDashboard();
