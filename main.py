@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List, Optional
@@ -8,6 +8,7 @@ from psycopg.rows import dict_row
 import secrets
 import os
 import smtplib
+import random
 from email.mime.text import MIMEText
 
 
@@ -35,6 +36,16 @@ ADMIN_LOGIN_CHALLENGES = {}
 ADMIN_SESSION_TTL_MINUTES = 30
 ADMIN_OTP_TTL_MINUTES = 5
 ADMIN_OTP_MAX_ATTEMPTS = 3
+
+ADMIN_LOGIN_RATE_WINDOW_SECONDS = 60
+ADMIN_LOGIN_RATE_LIMIT_FAILS = 5
+ADMIN_LOGIN_RATE_BLOCK_SECONDS = 60
+ADMIN_LOGIN_CAPTCHA_FAILS = 10
+ADMIN_LOGIN_CAPTCHA_SECONDS = 3600
+ADMIN_LOGIN_HARD_BLOCK_FAILS = 20
+ADMIN_LOGIN_HARD_BLOCK_SECONDS = 3600
+
+ADMIN_LOGIN_GUARD = {}
 
 
 # =============================
@@ -255,16 +266,17 @@ def write_log(event_type: str,
               machine_id: str = "",
               status: str = "",
               message: str = "",
-              actor: str = ""):
+              actor: str = "",
+              ip_address: str = ""):
     try:
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("""
         INSERT INTO license_logs (
             created_at, event_type, license_key, account_login, broker_server,
-            machine_id, status, message, actor
+            machine_id, status, message, actor, ip_address
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             utc_now_str(),
             event_type,
@@ -274,7 +286,8 @@ def write_log(event_type: str,
             machine_id,
             status,
             message,
-            actor
+            actor,
+            ip_address
         ))
         conn.commit()
         conn.close()
@@ -576,6 +589,177 @@ def cleanup_expired_admin_sessions():
         del ADMIN_SESSIONS[token]
 
 
+def get_client_ip(request: Request) -> str:
+    xff = (request.headers.get("x-forwarded-for") or "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    real_ip = (request.headers.get("x-real-ip") or "").strip()
+    if real_ip:
+        return real_ip
+    if request.client and request.client.host:
+        return str(request.client.host)
+    return ""
+
+
+def admin_login_guard_key(ip_address: str, username: str) -> str:
+    return (ip_address.strip() + "|" + username.strip().lower()).strip("|")
+
+
+def cleanup_admin_login_guard():
+    now = utc_now()
+    keys_to_delete = []
+    for key, item in ADMIN_LOGIN_GUARD.items():
+        blocked_until = item.get("blocked_until")
+        captcha_until = item.get("captcha_required_until")
+        last_fail = item.get("last_failed_at")
+        fail_times = item.get("fail_times", [])
+        fail_times = [t for t in fail_times if (now - t).total_seconds() <= ADMIN_LOGIN_RATE_WINDOW_SECONDS]
+        item["fail_times"] = fail_times
+
+        keep = False
+        if fail_times:
+            keep = True
+        if item.get("consecutive_fail_count", 0) > 0 and last_fail and (now - last_fail).total_seconds() <= 86400:
+            keep = True
+        if blocked_until and blocked_until > now:
+            keep = True
+        if captcha_until and captcha_until > now:
+            keep = True
+
+        if not keep:
+            keys_to_delete.append(key)
+
+    for key in keys_to_delete:
+        del ADMIN_LOGIN_GUARD[key]
+
+
+def ensure_admin_captcha(item: dict) -> str:
+    question = (item.get("captcha_question") or "").strip()
+    answer = str(item.get("captcha_answer") or "").strip()
+    if question != "" and answer != "":
+        return question
+
+    a = random.randint(1, 9)
+    b = random.randint(1, 9)
+    item["captcha_question"] = f"{a} + {b} = ?"
+    item["captcha_answer"] = str(a + b)
+    return item["captcha_question"]
+
+
+def get_admin_login_guard_state(ip_address: str, username: str) -> tuple[str, dict]:
+    cleanup_admin_login_guard()
+    key = admin_login_guard_key(ip_address, username)
+    item = ADMIN_LOGIN_GUARD.get(key)
+    if not item:
+        item = {
+            "ip_address": ip_address,
+            "username": username,
+            "fail_times": [],
+            "consecutive_fail_count": 0,
+            "blocked_until": None,
+            "captcha_required_until": None,
+            "captcha_question": "",
+            "captcha_answer": "",
+            "last_failed_at": None,
+        }
+        ADMIN_LOGIN_GUARD[key] = item
+    return key, item
+
+
+def clear_admin_login_guard_success(ip_address: str, username: str):
+    key = admin_login_guard_key(ip_address, username)
+    if key in ADMIN_LOGIN_GUARD:
+        del ADMIN_LOGIN_GUARD[key]
+
+
+def register_admin_login_failure(ip_address: str, username: str):
+    now = utc_now()
+    key, item = get_admin_login_guard_state(ip_address, username)
+    fail_times = [t for t in item.get("fail_times", []) if (now - t).total_seconds() <= ADMIN_LOGIN_RATE_WINDOW_SECONDS]
+    fail_times.append(now)
+    item["fail_times"] = fail_times
+    item["consecutive_fail_count"] = int(item.get("consecutive_fail_count", 0)) + 1
+    item["last_failed_at"] = now
+
+    minute_fail_count = len(fail_times)
+    rate_limited_now = False
+    captcha_enabled_now = False
+    hard_blocked_now = False
+
+    if minute_fail_count > ADMIN_LOGIN_RATE_LIMIT_FAILS:
+        prev_blocked_until = item.get("blocked_until")
+        should_log = (prev_blocked_until is None) or (prev_blocked_until <= now)
+        item["blocked_until"] = now + timedelta(seconds=ADMIN_LOGIN_RATE_BLOCK_SECONDS)
+        rate_limited_now = True
+        if should_log:
+            write_log(
+                event_type="admin_login_rate_limited",
+                status="warn",
+                message=f"More than {ADMIN_LOGIN_RATE_LIMIT_FAILS} failed login attempts in 1 minute for username={username}",
+                actor="security",
+                ip_address=ip_address
+            )
+
+    if item["consecutive_fail_count"] >= ADMIN_LOGIN_CAPTCHA_FAILS:
+        prev_captcha_until = item.get("captcha_required_until")
+        should_log = (prev_captcha_until is None) or (prev_captcha_until <= now)
+        item["captcha_required_until"] = now + timedelta(seconds=ADMIN_LOGIN_CAPTCHA_SECONDS)
+        ensure_admin_captcha(item)
+        captcha_enabled_now = True
+        if should_log:
+            write_log(
+                event_type="admin_login_captcha_required",
+                status="warn",
+                message=f"Captcha required after {item['consecutive_fail_count']} failed login attempts for username={username}",
+                actor="security",
+                ip_address=ip_address
+            )
+
+    if item["consecutive_fail_count"] >= ADMIN_LOGIN_HARD_BLOCK_FAILS:
+        prev_blocked_until = item.get("blocked_until")
+        should_log = (prev_blocked_until is None) or (prev_blocked_until <= now) or ((prev_blocked_until - now).total_seconds() < ADMIN_LOGIN_HARD_BLOCK_SECONDS - 5)
+        item["blocked_until"] = now + timedelta(seconds=ADMIN_LOGIN_HARD_BLOCK_SECONDS)
+        hard_blocked_now = True
+        if should_log:
+            write_log(
+                event_type="admin_login_hard_blocked",
+                status="fail",
+                message=f"Admin login hard blocked for 1 hour after {item['consecutive_fail_count']} consecutive failed login attempts for username={username}",
+                actor="security",
+                ip_address=ip_address
+            )
+
+    ADMIN_LOGIN_GUARD[key] = item
+    return item, {
+        "minute_fail_count": minute_fail_count,
+        "rate_limited_now": rate_limited_now,
+        "captcha_enabled_now": captcha_enabled_now,
+        "hard_blocked_now": hard_blocked_now,
+    }
+
+
+def admin_login_security_response(item: dict, default_message: str = "Invalid username or password") -> dict:
+    now = utc_now()
+    blocked_until = item.get("blocked_until")
+    captcha_until = item.get("captcha_required_until")
+    response = {
+        "ok": False,
+        "message": default_message
+    }
+
+    if blocked_until and blocked_until > now:
+        seconds_left = max(1, int((blocked_until - now).total_seconds()))
+        response["message"] = f"Too many failed login attempts. Try again in {seconds_left} seconds."
+        response["blocked_until"] = blocked_until.strftime("%Y-%m-%d %H:%M:%S")
+
+    if captcha_until and captcha_until > now:
+        response["captcha_required"] = True
+        response["captcha_question"] = ensure_admin_captcha(item)
+        response["captcha_until"] = captcha_until.strftime("%Y-%m-%d %H:%M:%S")
+
+    return response
+
+
 def require_admin_token(x_admin_token: Optional[str]):
     cleanup_expired_admin_sessions()
 
@@ -672,7 +856,8 @@ def init_db():
                 machine_id TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT '',
                 message TEXT NOT NULL DEFAULT '',
-                actor TEXT NOT NULL DEFAULT ''
+                actor TEXT NOT NULL DEFAULT '',
+                ip_address TEXT NOT NULL DEFAULT ''
             )
             """)
 
@@ -698,11 +883,6 @@ def init_db():
             ensure_column(cur, "licenses", "locked_broker_server", "TEXT")
             ensure_column(cur, "licenses", "locked_at", "TEXT")
 
-            ensure_column(cur, "activations", "balance", "DOUBLE PRECISION NOT NULL DEFAULT 0")
-            ensure_column(cur, "activations", "equity", "DOUBLE PRECISION NOT NULL DEFAULT 0")
-            ensure_column(cur, "activations", "open_positions_count", "INTEGER NOT NULL DEFAULT 0")
-            ensure_column(cur, "activations", "floating_pnl", "DOUBLE PRECISION NOT NULL DEFAULT 0")
-            
             cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_license_key ON licenses(license_key)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_activations_license_id ON activations(license_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_activations_last_seen_at ON activations(last_seen_at)")
@@ -994,6 +1174,7 @@ def validate_license_simple(license_key: str):
 class AdminLoginStartRequest(BaseModel):
     username: str
     password: str
+    captcha_answer: Optional[str] = ""
 
 
 class AdminLoginVerifyRequest(BaseModel):
@@ -1340,19 +1521,40 @@ def slave_report_error(payload: SlaveErrorReportRequest):
 # Admin Auth
 # =============================
 @app.post("/admin/login/start")
-def admin_login_start(payload: AdminLoginStartRequest):
+def admin_login_start(payload: AdminLoginStartRequest, request: Request):
     cleanup_expired_login_challenges()
 
-    if payload.username != get_admin_username() or payload.password != get_admin_password():
-        return {
-            "ok": False,
-            "message": "Invalid username or password"
-        }
+    username = (payload.username or "").strip()
+    ip_address = get_client_ip(request)
+    _, guard = get_admin_login_guard_state(ip_address, username)
+    now = utc_now()
+
+    blocked_until = guard.get("blocked_until")
+    if blocked_until and blocked_until > now:
+        return admin_login_security_response(guard)
+
+    captcha_until = guard.get("captcha_required_until")
+    if captcha_until and captcha_until > now:
+        expected_answer = str(guard.get("captcha_answer") or "").strip()
+        provided_answer = str(payload.captcha_answer or "").strip()
+        if provided_answer == "" or provided_answer != expected_answer:
+            register_admin_login_failure(ip_address, username)
+            _, guard = get_admin_login_guard_state(ip_address, username)
+            response = admin_login_security_response(guard, "Captcha verification required")
+            response["message"] = "Captcha verification required"
+            return response
+
+    if username != get_admin_username() or payload.password != get_admin_password():
+        register_admin_login_failure(ip_address, username)
+        _, guard = get_admin_login_guard_state(ip_address, username)
+        return admin_login_security_response(guard)
+
+    clear_admin_login_guard_success(ip_address, username)
 
     if not get_admin_otp_enabled():
         token = create_admin_session_token()
         ADMIN_SESSIONS[token] = {
-            "username": payload.username,
+            "username": username,
             "created_at": utc_now(),
             "last_seen_at": utc_now()
         }
@@ -1361,7 +1563,7 @@ def admin_login_start(payload: AdminLoginStartRequest):
             "ok": True,
             "message": "Login successful (OTP disabled)",
             "token": token,
-            "username": payload.username,
+            "username": username,
             "otp_required": False
         }
 
@@ -1377,7 +1579,7 @@ def admin_login_start(payload: AdminLoginStartRequest):
     expires_at = utc_now() + timedelta(minutes=ADMIN_OTP_TTL_MINUTES)
 
     ADMIN_LOGIN_CHALLENGES[challenge_id] = {
-        "username": payload.username,
+        "username": username,
         "code": code,
         "expires_at": expires_at,
         "attempts": 0
@@ -2064,7 +2266,8 @@ def admin_logs(limit: int = 15, offset: int = 0, x_admin_token: Optional[str] = 
         machine_id,
         status,
         message,
-        actor
+        actor,
+        ip_address
     FROM license_logs
     ORDER BY id DESC
     LIMIT %s OFFSET %s
@@ -2251,6 +2454,10 @@ def admin_panel():
             <div>
                 <label>Password</label>
                 <input id="adminPassword" type="password" placeholder="Password">
+            </div>
+            <div id="captchaWrap" class="hidden">
+                <label id="captchaQuestion">Captcha</label>
+                <input id="adminCaptchaAnswer" type="text" placeholder="Answer">
             </div>
             <button onclick="startLogin()">Send verification code</button>
         </div>
@@ -2508,6 +2715,16 @@ function showLoginMessage(text, type = "success") {
     el.style.display = "block";
 }
 
+function hideCaptcha() {
+    document.getElementById("captchaWrap").classList.add("hidden");
+    document.getElementById("adminCaptchaAnswer").value = "";
+}
+
+function showCaptcha(question) {
+    document.getElementById("captchaWrap").classList.remove("hidden");
+    document.getElementById("captchaQuestion").textContent = question || "Captcha";
+}
+
 function pad2(n) {
     return String(n).padStart(2, "0");
 }
@@ -2603,6 +2820,7 @@ function showLoginOnly() {
     loginChallengeId = "";
     document.getElementById("step1").classList.remove("hidden");
     document.getElementById("step2").classList.add("hidden");
+    hideCaptcha();
 }
 
 function showAppOnly() {
@@ -2631,6 +2849,7 @@ function backToStep1() {
     loginChallengeId = "";
     document.getElementById("step1").classList.remove("hidden");
     document.getElementById("step2").classList.add("hidden");
+    hideCaptcha();
     showLoginMessage("", "success");
     document.getElementById("loginResult").style.display = "none";
 }
@@ -2638,13 +2857,17 @@ function backToStep1() {
 async function startLogin() {
     const username = document.getElementById("adminUsername").value.trim();
     const password = document.getElementById("adminPassword").value.trim();
+    const captcha_answer = document.getElementById("adminCaptchaAnswer").value.trim();
 
     const result = await apiPost("/admin/login/start", {
         username: username,
-        password: password
+        password: password,
+        captcha_answer: captcha_answer
     });
 
     if (result.ok) {
+        hideCaptcha();
+
         if (result.token) {
             setToken(result.token);
 
@@ -2669,6 +2892,9 @@ async function startLogin() {
 
         showLoginMessage("Verification code sent successfully.", "success");
     } else {
+        if (result.captcha_required) {
+            showCaptcha(result.captcha_question || "Captcha");
+        }
         showLoginMessage(result.message || "Invalid username or password.", "error");
     }
 }
@@ -3150,6 +3376,7 @@ async function loadLogs() {
         <th>Account</th>
         <th>Broker</th>
         <th>Machine</th>
+        <th>IP</th>
         <th>Status</th>
         <th>Message</th>
         <th>Actor</th>
@@ -3164,6 +3391,7 @@ async function loadLogs() {
             <td>${escapeHtml(row.account_login || "")}</td>
             <td>${escapeHtml(row.broker_server || "")}</td>
             <td>${escapeHtml(row.machine_id || "")}</td>
+            <td>${escapeHtml(row.ip_address || "")}</td>
             <td>${escapeHtml(row.status || "")}</td>
             <td>${escapeHtml(row.message || "")}</td>
             <td>${escapeHtml(row.actor || "")}</td>
